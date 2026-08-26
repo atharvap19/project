@@ -1,0 +1,8 @@
+streamlit
+pymupdf
+python-docx
+language-tool-python
+textstat
+rapidfuzz
+regex
+Pillow
