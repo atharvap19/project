@@ -8,6 +8,34 @@ class PageNumberRule(BaseRule):
     rule_id = 11
     rule_name = "Page Number Validation"
 
+    # A bare number is not a page number: identifiers such as
+    # "SOP-001" would match it. Require the word "page", or the
+    # "1 of 5" form that only page numbers use.
+    PAGE_PATTERNS = [
+        re.compile(
+            r"\bpage\s*[:\-]?\s*(\d+)\b",
+            re.IGNORECASE
+        ),
+        re.compile(
+            r"(?<![\w\-])(\d+)\s*(?:of|/)\s*\d+(?![\w\-])",
+            re.IGNORECASE
+        ),
+    ]
+
+    def extract_page_number(self, text):
+
+        if not text:
+            return None
+
+        for pattern in self.PAGE_PATTERNS:
+
+            match = pattern.search(text)
+
+            if match:
+                return int(match.group(1))
+
+        return None
+
     def check(self, document):
 
         pages = document.get("pages", [])
@@ -17,116 +45,115 @@ class PageNumberRule(BaseRule):
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
-                "status": "WARNING",
-                "message": "No pages were available for checking.",
+                "status": "ERROR",
+                "message": "No page information is available.",
+                "page": None,
                 "evidence": {}
             }
 
-        found_page_numbers = []
+        page_results = []
+        missing_pages = []
+        incorrect_pages = []
 
-        # --------------------------------
-        # Check each page
-        # --------------------------------
+        for expected_page in pages:
 
-        for page in pages:
+            page_number = expected_page["page_number"]
 
-            page_text = page.get("text", "")
-            page_number = page.get("page_number")
+            # Footer is the preferred location
+            footer = expected_page.get(
+                "footer",
+                ""
+            )
 
-            # Search for common page number formats
-            patterns = [
-                rf"\bpage\s+{page_number}\b",
-                rf"\b{page_number}\s+of\s+\d+\b"
-            ]
+            # If footer isn't available, use page text
+            text_to_check = footer
 
-            found = False
-
-            for pattern in patterns:
-
-                if re.search(
-                    pattern,
-                    page_text,
-                    re.IGNORECASE
-                ):
-                    found = True
-                    break
-
-            # Also check standalone number
-            if not found:
-
-                matches = re.findall(
-                    r"\b\d+\b",
-                    page_text
+            if not text_to_check:
+                text_to_check = expected_page.get(
+                    "text",
+                    ""
                 )
 
-                if str(page_number) in matches:
-                    found = True
+            found_number = self.extract_page_number(
+                text_to_check
+            )
 
-            if found:
+            result = {
+                "page": page_number,
+                "expected": page_number,
+                "found": found_number
+            }
 
-                found_page_numbers.append(page_number)
+            page_results.append(result)
 
-        # --------------------------------
-        # Check missing page numbers
-        # --------------------------------
+            if found_number is None:
 
-        expected = [
-            page["page_number"]
-            for page in pages
-        ]
+                missing_pages.append(
+                    page_number
+                )
 
-        missing = [
-            number
-            for number in expected
-            if number not in found_page_numbers
-        ]
+            elif found_number != page_number:
 
-        # --------------------------------
-        # Check sequence
-        # --------------------------------
+                incorrect_pages.append(result)
 
-        sequential = (
-            found_page_numbers == expected
-        )
+        # -----------------------------------------
+        # Missing page numbers
+        # -----------------------------------------
 
-        # --------------------------------
-        # Final result
-        # --------------------------------
-
-        if missing:
+        if missing_pages:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "FAIL",
-                "message": "Page numbers are missing on one or more pages.",
+                "message": (
+                    "Page numbers are missing on "
+                    "one or more pages."
+                ),
+                "page": missing_pages[0],
                 "evidence": {
-                    "expected": expected,
-                    "found": found_page_numbers,
-                    "missing": missing
+                    "pages": page_results,
+                    "missing_pages": missing_pages,
+                    "incorrect_pages": incorrect_pages
                 }
             }
 
-        if not sequential:
+        # -----------------------------------------
+        # Incorrect page numbers
+        # -----------------------------------------
+
+        if incorrect_pages:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "FAIL",
-                "message": "Page numbers are not in sequence.",
+                "message": (
+                    "Page numbers are not in the "
+                    "correct sequence."
+                ),
+                "page": incorrect_pages[0]["page"],
                 "evidence": {
-                    "expected": expected,
-                    "found": found_page_numbers
+                    "pages": page_results,
+                    "missing_pages": missing_pages,
+                    "incorrect_pages": incorrect_pages
                 }
             }
+
+        # -----------------------------------------
+        # PASS
+        # -----------------------------------------
 
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
             "status": "PASS",
-            "message": "Page numbers are present and sequential.",
+            "message": (
+                "Page numbers are present and "
+                "in sequence."
+            ),
+            "page": 1,
             "evidence": {
-                "expected": expected,
-                "found": found_page_numbers
+                "pages": page_results
             }
         }

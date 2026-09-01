@@ -8,56 +8,50 @@ class RevisionSectionRule(BaseRule):
     rule_id = 5
     rule_name = "Revision Section Validation"
 
+    REVISION_LABELS = [
+        "revision history",
+        "revision record",
+        "document history",
+        "change history",
+        "revision"
+    ]
+
     def check(self, document):
 
-        full_text = document["full_text"]
+        for page in document["pages"]:
 
-        patterns = [
-            r"\brevision\s+history\b",
-            r"\brevision\s+record\b",
-            r"\brevision\s+log\b",
-            r"\bdocument\s+history\b",
-            r"\bchange\s+history\b"
-        ]
+            page_number = page["page_number"]
+            page_text = page.get("text", "")
 
-        found_section = None
+            for label in self.REVISION_LABELS:
 
-        for pattern in patterns:
+                match = re.search(
+                    rf"\b{re.escape(label)}\b",
+                    page_text,
+                    re.IGNORECASE
+                )
 
-            match = re.search(
-                pattern,
-                full_text,
-                re.IGNORECASE
-            )
+                if match:
 
-            if match:
-                found_section = match.group(0)
-                break
-
-        if found_section:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "PASS",
-                "message": "Revision section is present.",
-                "evidence": {
-                    "section": found_section
-                }
-            }
+                    return {
+                        "rule_id": self.rule_id,
+                        "rule_name": self.rule_name,
+                        "status": "PASS",
+                        "message": "Revision section is present.",
+                        "page": page_number,
+                        "evidence": {
+                            "section": match.group(0),
+                            "page": page_number
+                        }
+                    }
 
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
             "status": "FAIL",
             "message": "Revision section is missing.",
+            "page": None,
             "evidence": {
-                "expected_sections": [
-                    "Revision History",
-                    "Revision Record",
-                    "Revision Log",
-                    "Document History",
-                    "Change History"
-                ]
+                "section": None
             }
         }

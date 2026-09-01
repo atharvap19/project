@@ -1,8 +1,9 @@
 streamlit
 pymupdf
-python-docx
+docx2pdf
 language-tool-python
 textstat
 rapidfuzz
 regex
 Pillow
+python-docx

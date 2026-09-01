@@ -8,98 +8,256 @@ class AuthorRule(BaseRule):
     rule_id = 2
     rule_name = "Author and Role Validation"
 
+    AUTHOR_LABELS = [
+        "author",
+        "author name",
+        "document author",
+        "prepared by",
+        "written by",
+        "created by",
+        "developed by"
+    ]
+
+    ROLE_LABELS = [
+        "role",
+        "author role",
+        "job role",
+        "designation",
+        "position",
+        "job title",
+        "title"
+    ]
+
+    def find_label_value(self, text, labels):
+
+        for label in labels:
+
+            pattern = rf"\b{re.escape(label)}\s*[:\-]\s*(.+)"
+
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE
+            )
+
+            if match:
+                value = match.group(1).strip()
+
+                if value:
+                    return {
+                        "label": label,
+                        "value": value,
+                        "source": "text"
+                    }
+
+        return None
+
+    def normalize_cell(self, text):
+        """
+        A table cell reduced to its label, without trailing punctuation.
+        """
+
+        cleaned = (text or "").strip()
+
+        cleaned = re.sub(r"[:\-\s]+$", "", cleaned)
+
+        return cleaned.strip().lower()
+
+    def value_for_label(self, rows, row_index, cell_index):
+        """
+        The value paired with a label cell.
+
+        Two layouts are common:
+
+            Author | John Smith     value sits to the right
+
+            Author                  value sits below, when the label is a
+            John Smith              column heading
+        """
+
+        row = rows[row_index]
+
+        # A label in the first row of a wide, multi-row table is a column
+        # heading, so the value is underneath rather than beside it.
+        # Without this, an "Author" column in a revision-history table would
+        # return the next heading instead of a name.
+        if row_index == 0 and len(rows) > 1 and len(row) > 2:
+
+            below = rows[1]
+
+            if cell_index < len(below):
+
+                value = (below[cell_index] or "").strip()
+
+                if value:
+                    return value
+
+        for value in row[cell_index + 1:]:
+
+            value = (value or "").strip()
+
+            if value:
+                return value
+
+        return None
+
+    def find_label_in_tables(self, tables, labels):
+        """
+        Look for a "label | value" pair in a table row.
+
+        Documents often put this information in a table rather than writing
+        "Author: name", which leaves no colon for find_label_value to match.
+
+        The label cell has to match exactly: a loose match would let the role
+        label "title" pick up the value from a "Document Title" row.
+        """
+
+        for label in labels:
+
+            for table in tables:
+
+                rows = table.get("rows", [])
+
+                for row_index, row in enumerate(rows):
+
+                    for cell_index, cell in enumerate(row):
+
+                        if self.normalize_cell(cell) != label:
+                            continue
+
+                        value = self.value_for_label(
+                            rows,
+                            row_index,
+                            cell_index
+                        )
+
+                        if value:
+                            return {
+                                "label": label,
+                                "value": value,
+                                "page": table.get("page"),
+                                "source": "table"
+                            }
+
+        return None
+
     def check(self, document):
 
-        full_text = document["full_text"]
+        author_found = None
+        role_found = None
 
-        #patterns for author
+        # Search the entire document
+        # while keeping the page where the information was found.
 
-        author_patterns = [
-            r"\bauthor\s*:\s*(.+)",
-            r"\bauthor\s+name\s*:\s*(.+)",
-            r"\bprepared\s+by\s*:\s*(.+)",
-            r"\bcreated\s+by\s*:\s*(.+)",
-            r"\bdrafted\s+by\s*:\s*(.+)"
-        ]
+        for page in document["pages"]:
 
-        
-        # Patterns for role
-        
-        role_patterns = [
-            r"\brole\s*:\s*(.+)",
-            r"\bauthor\s+role\s*:\s*(.+)",
-            r"\bdesignation\s*:\s*(.+)",
-            r"\bposition\s*:\s*(.+)",
-            r"\bjob\s+title\s*:\s*(.+)"
-        ]
+            page_number = page["page_number"]
+            page_text = page.get("text", "")
 
-    
-        # Find author
-        
-        author_match = None
+            # Find author
+            if author_found is None:
 
-        for pattern in author_patterns:
+                result = self.find_label_value(
+                    page_text,
+                    self.AUTHOR_LABELS
+                )
 
-            match = re.search(
-                pattern,
-                full_text,
-                re.IGNORECASE
-            )
+                if result:
+                    author_found = {
+                        **result,
+                        "page": page_number
+                    }
 
-            if match:
-                author_match = match.group(1).strip()
-                break
-       
-        # Find role
-        
-        role_match = None
+            # Find role
+            if role_found is None:
 
-        for pattern in role_patterns:
+                result = self.find_label_value(
+                    page_text,
+                    self.ROLE_LABELS
+                )
 
-            match = re.search(
-                pattern,
-                full_text,
-                re.IGNORECASE
-            )
+                if result:
+                    role_found = {
+                        **result,
+                        "page": page_number
+                    }
 
-            if match:
-                role_match = match.group(1).strip()
+            if author_found and role_found:
                 break
 
+        # Nothing written as "Author: name" in the running text, so fall back
+        # to label/value pairs in the document's tables.
 
-        # Determine result
+        tables = document.get("tables", [])
 
-        if author_match and role_match:
+        if author_found is None:
+
+            author_found = self.find_label_in_tables(
+                tables,
+                self.AUTHOR_LABELS
+            )
+
+        if role_found is None:
+
+            role_found = self.find_label_in_tables(
+                tables,
+                self.ROLE_LABELS
+            )
+
+        # Both found
+        if author_found and role_found:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "PASS",
                 "message": "Author name and role are present.",
+                "page": author_found["page"],
                 "evidence": {
-                    "author": author_match,
-                    "role": role_match
+                    "author": author_found,
+                    "role": role_found
                 }
             }
 
-        # Missing information
- 
-        missing = []
+        # Author found, role missing
+        if author_found and not role_found:
 
-        if not author_match:
-            missing.append("author name")
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.rule_name,
+                "status": "FAIL",
+                "message": "Author name was found, but role is missing.",
+                "page": author_found["page"],
+                "evidence": {
+                    "author": author_found,
+                    "role": None
+                }
+            }
 
-        if not role_match:
-            missing.append("author role")
+        # Role found, author missing
+        if not author_found and role_found:
 
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.rule_name,
+                "status": "FAIL",
+                "message": "Role was found, but author name is missing.",
+                "page": role_found["page"],
+                "evidence": {
+                    "author": None,
+                    "role": role_found
+                }
+            }
+
+        # Neither found
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
             "status": "FAIL",
             "message": "Required author information is missing.",
+            "page": None,
             "evidence": {
-                "author": author_match,
-                "role": role_match,
-                "missing": missing
+                "author": None,
+                "role": None
             }
         }

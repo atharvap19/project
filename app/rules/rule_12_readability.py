@@ -1,3 +1,4 @@
+import re
 import textstat
 
 from .base import BaseRule
@@ -8,99 +9,168 @@ class ReadabilityRule(BaseRule):
     rule_id = 12
     rule_name = "Readability Validation"
 
+    def split_sentences(self, text):
+
+        sentences = re.split(
+            r"[.!?]+",
+            text
+        )
+
+        return [
+            sentence.strip()
+            for sentence in sentences
+            if sentence.strip()
+        ]
+
+    def average_sentence_length(self, text):
+
+        sentences = self.split_sentences(text)
+
+        if not sentences:
+            return 0
+
+        total_words = sum(
+            len(sentence.split())
+            for sentence in sentences
+        )
+
+        return total_words / len(sentences)
+
     def check(self, document):
 
-        full_text = document.get("full_text", "")
+        text = document.get(
+            "full_text",
+            ""
+        )
 
-        if not full_text.strip():
+        if not text.strip():
+
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.rule_name,
+                "status": "ERROR",
+                "message": "No document text was available.",
+                "page": None,
+                "evidence": {}
+            }
+
+        # -----------------------------------------
+        # Readability metrics
+        # -----------------------------------------
+
+        try:
+
+            sentence_length = (
+                self.average_sentence_length(text)
+            )
+
+            word_count = len(
+                text.split()
+            )
+
+            syllable_count = textstat.syllable_count(
+                text
+            )
+
+            readability_score = (
+                textstat.flesch_reading_ease(text)
+            )
+
+        except Exception as e:
+
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.rule_name,
+                "status": "ERROR",
+                "message": (
+                    f"Readability analysis failed: {str(e)}"
+                ),
+                "page": None,
+                "evidence": {}
+            }
+
+        # -----------------------------------------
+        # Basic thresholds
+        # -----------------------------------------
+
+        issues = []
+
+        # Long average sentence
+        if sentence_length > 30:
+
+            issues.append({
+                "type": "sentence_length",
+                "message": (
+                    "Average sentence length is "
+                    "greater than 30 words."
+                ),
+                "value": sentence_length
+            })
+
+        # Very low readability score
+        if readability_score < 30:
+
+            issues.append({
+                "type": "readability",
+                "message": (
+                    "The document has a low "
+                    "readability score."
+                ),
+                "value": readability_score
+            })
+
+        # -----------------------------------------
+        # WARNING
+        # -----------------------------------------
+
+        if issues:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "WARNING",
-                "message": "No text was available for readability analysis.",
-                "evidence": {}
+                "message": (
+                    "Document may be difficult to read."
+                ),
+                "page": None,
+                "evidence": {
+                    "average_sentence_length": round(
+                        sentence_length,
+                        2
+                    ),
+                    "word_count": word_count,
+                    "syllable_count": syllable_count,
+                    "flesch_reading_ease": round(
+                        readability_score,
+                        2
+                    ),
+                    "issues": issues
+                }
             }
 
-        # --------------------------------
-        # Calculate readability
-        # --------------------------------
-
-        reading_score = textstat.flesch_reading_ease(
-            full_text
-        )
-
-        grade_level = textstat.flesch_kincaid_grade(
-            full_text
-        )
-
-        avg_sentence_length = (
-            textstat.words_per_sentence(
-                full_text
-            )
-        )
-
-        avg_word_length = (
-            textstat.avg_letter_per_word(
-                full_text
-            )
-        )
-
-        # --------------------------------
-        # Determine readability
-        # --------------------------------
-
-        if reading_score >= 60:
-
-            status = "PASS"
-
-            message = (
-                "Document has a generally good "
-                "readability level."
-            )
-
-        elif reading_score >= 40:
-
-            status = "WARNING"
-
-            message = (
-                "Document may be moderately difficult "
-                "to read."
-            )
-
-        else:
-
-            status = "FAIL"
-
-            message = (
-                "Document may be difficult to read."
-            )
-
-        # --------------------------------
-        # Return result
-        # --------------------------------
+        # -----------------------------------------
+        # PASS
+        # -----------------------------------------
 
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
-            "status": status,
-            "message": message,
+            "status": "PASS",
+            "message": (
+                "Document readability is acceptable."
+            ),
+            "page": None,
             "evidence": {
-                "flesch_reading_ease": round(
-                    reading_score,
-                    2
-                ),
-                "flesch_kincaid_grade": round(
-                    grade_level,
-                    2
-                ),
                 "average_sentence_length": round(
-                    avg_sentence_length,
+                    sentence_length,
                     2
                 ),
-                "average_word_length": round(
-                    avg_word_length,
+                "word_count": word_count,
+                "syllable_count": syllable_count,
+                "flesch_reading_ease": round(
+                    readability_score,
                     2
-                )
+                ),
+                "issues": []
             }
         }

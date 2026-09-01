@@ -10,78 +10,94 @@ class LanguageRule(BaseRule):
 
     def check(self, document):
 
-        full_text = document.get("full_text", "")
+        text = document.get(
+            "full_text",
+            ""
+        )
 
-        if not full_text.strip():
+        if not text.strip():
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
-                "status": "WARNING",
-                "message": "No text was available for language checking.",
+                "status": "ERROR",
+                "message": "No document text was available.",
+                "page": None,
                 "evidence": {}
             }
 
-        # --------------------------------
-        # Start LanguageTool
-        # --------------------------------
+        try:
 
-        tool = language_tool_python.LanguageTool(
-            "en-US"
-        )
+            tool = language_tool_python.LanguageTool(
+                "en-US"
+            )
 
-        # --------------------------------
-        # Find language errors
-        # --------------------------------
+            matches = tool.check(text)
 
-        matches = tool.check(full_text)
+            errors = []
 
-        # --------------------------------
-        # Collect errors
-        # --------------------------------
+            for match in matches:
 
-        errors = []
+                # Get the text that caused the issue
+                offset = match.offset
+                length = match.error_length
 
-        for match in matches:
+                original = text[
+                    offset: offset + length
+                ]
 
-            errors.append({
-                "message": match.message,
-                "suggestions": match.replacements[:5],
-                "context": match.context,
-                "offset": match.offset,
-                "length": match.errorLength
-            })
+                suggestions = match.replacements
 
-        # --------------------------------
-        # Close LanguageTool
-        # --------------------------------
+                errors.append({
+                    "message": match.message,
+                    "original": original,
+                    "suggestions": suggestions,
+                    "offset": offset
+                })
 
-        tool.close()
+            tool.close()
 
-        # --------------------------------
-        # Decide result
-        # --------------------------------
-
-        if errors:
+        except Exception as e:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": f"{len(errors)} language issue(s) detected.",
+                "status": "ERROR",
+                "message": f"Language check failed: {str(e)}",
+                "page": None,
+                "evidence": {}
+            }
+
+        # -----------------------------------------
+        # No errors
+        # -----------------------------------------
+
+        if not errors:
+
+            return {
+                "rule_id": self.rule_id,
+                "rule_name": self.rule_name,
+                "status": "PASS",
+                "message": "No significant language errors were detected.",
+                "page": None,
                 "evidence": {
-                    "error_count": len(errors),
-                    "errors": errors
+                    "errors": []
                 }
             }
+
+        # -----------------------------------------
+        # Errors found
+        # -----------------------------------------
 
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": "No language errors were detected.",
+            "status": "WARNING",
+            "message": (
+                f"{len(errors)} language issue(s) detected."
+            ),
+            "page": None,
             "evidence": {
-                "error_count": 0,
-                "errors": []
+                "errors": errors
             }
         }

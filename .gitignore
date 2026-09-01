@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# Uploaded documents and the PDFs rendered from them
+uploads/*
+converted/*
+!uploads/.gitkeep
+!converted/.gitkeep

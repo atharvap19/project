@@ -1,4 +1,5 @@
 import sys
+
 from pathlib import Path
 
 sys.path.insert(
@@ -7,11 +8,10 @@ sys.path.insert(
 )
 
 import streamlit as st
-import tempfile
 
-from app.converter.docx_to_pdf import convert_docx_to_pdf
-from app.extractor.pdf_extractor import extract_pdf
+from app.converter.docx_to_pdf import ConversionError
 from app.engine.rule_engine import RuleEngine
+from app.pipeline import extract_document, save_upload
 
 
 # ---------------------------------------
@@ -61,230 +61,226 @@ if uploaded_file:
         try:
 
             # --------------------------------
-            # Temporary directory
+            # Save uploaded DOCX to uploads/
             # --------------------------------
 
-            with tempfile.TemporaryDirectory() as temp_dir:
+            docx_path = save_upload(
+                uploaded_file.getbuffer(),
+                uploaded_file.name
+            )
 
-                temp_dir = Path(temp_dir)
 
-                docx_path = (
-                    temp_dir /
-                    uploaded_file.name
-                )
+            st.info(
+                "Step 1/2: Document uploaded"
+            )
 
-                # --------------------------------
-                # Save uploaded DOCX
-                # --------------------------------
+            # --------------------------------
+            # Render to PDF and extract
+            # --------------------------------
 
-                with open(
+            with st.spinner(
+                "Converting to PDF and extracting..."
+            ):
+
+                # The uploaded name is passed through because Rule 1
+                # compares the title against it.
+                document = extract_document(
                     docx_path,
-                    "wb"
-                ) as file:
-
-                    file.write(
-                        uploaded_file.getbuffer()
-                    )
-
-                st.info(
-                    "Step 1/4: Document uploaded"
+                    filename=uploaded_file.name
                 )
 
-                # --------------------------------
-                # DOCX → PDF
-                # --------------------------------
+            st.success(
+                "Step 2/2: Document extracted successfully"
+            )
 
-                with st.spinner(
-                    "Converting DOCX to PDF..."
-                ):
+            # --------------------------------
+            # Extracted Information
+            # --------------------------------
 
-                    pdf_path = (
-                        convert_docx_to_pdf(
-                            docx_path,
-                            temp_dir
-                        )
-                    )
+            st.subheader(
+                "Extracted Information"
+            )
 
-                st.success(
-                    "Step 2/4: DOCX converted to PDF"
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+
+                st.metric(
+                    "Pages",
+                    document.get("page_count", 0)
                 )
 
-                # --------------------------------
-                # Extract PDF
-                # --------------------------------
+            with col2:
 
-                with st.spinner(
-                    "Extracting document information..."
-                ):
-
-                    document = extract_pdf(
-                        pdf_path
-                    )
-
-                document["filename"] = (
-                    uploaded_file.name
+                st.metric(
+                    "Text spans",
+                    len(document.get("formatting", []))
                 )
 
-                st.success(
-                    "Step 3/4: PDF extracted successfully"
+            with col3:
+
+                st.metric(
+                    "Tables",
+                    len(document.get("tables", []))
                 )
 
-                # --------------------------------
-                # Extracted Information
-                # --------------------------------
+            # --------------------------------
+            # Full Text
+            # --------------------------------
 
-                st.subheader(
-                    "Extracted Information"
+            with st.expander(
+                "Extracted Text"
+            ):
+
+                st.text(
+                    document.get(
+                        "full_text",
+                        ""
+                    )
                 )
 
-                col1, col2, col3 = st.columns(3)
+            # --------------------------------
+            # Pages
+            # --------------------------------
 
-                with col1:
+            with st.expander(
+                "Page Information"
+            ):
 
-                    st.metric(
-                        "Pages",
-                        len(document["pages"])
+                for page in document.get("pages", []):
+
+                    st.markdown(
+                        f"**Page {page['page_number']}**"
                     )
-
-                with col2:
-
-                    st.metric(
-                        "Dates Found",
-                        len(document["dates"])
-                    )
-
-                with col3:
-
-                    st.metric(
-                        "Signatures Found",
-                        len(document["signatures"])
-                    )
-
-                # --------------------------------
-                # Dates
-                # --------------------------------
-
-                with st.expander(
-                    "Detected Dates"
-                ):
-
-                    st.json(
-                        document["dates"]
-                    )
-
-                # --------------------------------
-                # Signatures
-                # --------------------------------
-
-                with st.expander(
-                    "Detected Signatures"
-                ):
-
-                    st.json(
-                        document["signatures"]
-                    )
-
-                # --------------------------------
-                # Fonts
-                # --------------------------------
-
-                with st.expander(
-                    "Font Information"
-                ):
-
-                    st.json(
-                        document["spans"][:50]
-                    )
-
-                # --------------------------------
-                # Footers
-                # --------------------------------
-
-                with st.expander(
-                    "Footer Information"
-                ):
-
-                    for page in document["pages"]:
-
-                        st.write(
-                            f"Page {page['page_number']}"
-                        )
-
-                        st.code(
-                            page["footer_text"]
-                        )
-
-                # --------------------------------
-                # Run Rule Engine
-                # --------------------------------
-
-                with st.spinner(
-                    "Running compliance rules..."
-                ):
-
-                    engine = RuleEngine()
-
-                    results = engine.run(
-                        document
-                    )
-
-                st.success(
-                    "Step 4/4: Rules completed"
-                )
-
-                # --------------------------------
-                # Results
-                # --------------------------------
-
-                st.subheader(
-                    "Compliance Results"
-                )
-
-                for result in results:
-
-                    status = result["status"]
-
-                    if status == "PASS":
-
-                        st.success(
-                            f"Rule {result['rule_id']} — "
-                            f"{result['rule_name']} — PASS"
-                        )
-
-                    elif status == "FAIL":
-
-                        st.error(
-                            f"Rule {result['rule_id']} — "
-                            f"{result['rule_name']} — FAIL"
-                        )
-
-                    elif status == "WARNING":
-
-                        st.warning(
-                            f"Rule {result['rule_id']} — "
-                            f"{result['rule_name']} — WARNING"
-                        )
-
-                    else:
-
-                        st.warning(
-                            f"Rule {result['rule_id']} — "
-                            f"{result['rule_name']} — ERROR"
-                        )
 
                     st.write(
-                        result["message"]
+                        {
+                            "header": page["header"],
+                            "footer": page["footer"],
+                            "tables": len(page["tables"])
+                        }
                     )
 
-                    if result.get("evidence"):
+                    st.text(page["text"])
 
-                        with st.expander(
-                            "View evidence"
-                        ):
+            # --------------------------------
+            # Tables
+            # --------------------------------
 
-                            st.json(
-                                result["evidence"]
-                            )
+            with st.expander(
+                "Table Information"
+            ):
+
+                st.json(
+                    document.get(
+                        "tables",
+                        []
+                    )
+                )
+
+            # --------------------------------
+            # Formatting
+            # --------------------------------
+
+            with st.expander(
+                "Font Information"
+            ):
+
+                st.json(
+                    document.get(
+                        "formatting",
+                        []
+                    )
+                )
+
+            # --------------------------------
+            # Document metadata
+            # --------------------------------
+
+            with st.expander(
+                "Document Metadata"
+            ):
+
+                st.json(
+                    document.get(
+                        "metadata",
+                        {}
+                    )
+                )
+
+            # --------------------------------
+            # Run Rule Engine
+            # --------------------------------
+
+            with st.spinner(
+                "Running compliance rules..."
+            ):
+
+                engine = RuleEngine()
+
+                results = engine.run(
+                    document
+                )
+
+            st.subheader(
+                "Compliance Results"
+            )
+
+            # --------------------------------
+            # Results
+            # --------------------------------
+
+            for result in results:
+
+                status = result["status"]
+
+                if status == "PASS":
+
+                    st.success(
+                        f"Rule {result['rule_id']} — "
+                        f"{result['rule_name']} — PASS"
+                    )
+
+                elif status == "FAIL":
+
+                    st.error(
+                        f"Rule {result['rule_id']} — "
+                        f"{result['rule_name']} — FAIL"
+                    )
+
+                elif status == "WARNING":
+
+                    st.warning(
+                        f"Rule {result['rule_id']} — "
+                        f"{result['rule_name']} — WARNING"
+                    )
+
+                else:
+
+                    st.warning(
+                        f"Rule {result['rule_id']} — "
+                        f"{result['rule_name']} — ERROR"
+                    )
+
+                st.write(
+                    result["message"]
+                )
+
+                if result.get("evidence"):
+
+                    with st.expander(
+                        "View evidence"
+                    ):
+
+                        st.json(
+                            result["evidence"]
+                        )
+
+        except ConversionError as e:
+
+            st.error(
+                f"Could not convert the document to PDF: {str(e)}"
+            )
 
         except Exception as e:
 

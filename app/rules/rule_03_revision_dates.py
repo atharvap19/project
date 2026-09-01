@@ -9,136 +9,142 @@ class RevisionDateRule(BaseRule):
     rule_id = 3
     rule_name = "Revision History Date Validation"
 
-    def check(self, document):
+    REVISION_LABELS = [
+        "revision history",
+        "revision record",
+        "document history",
+        "change history",
+        "revision"
+    ]
 
-        full_text = document["full_text"]
+    DATE_PATTERNS = [
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b"
+    ]
 
-        # --------------------------------
-        # 1. Find Revision History section
-        # --------------------------------
+    def parse_date(self, date_text):
 
-        revision_patterns = [
-            r"revision\s+history",
-            r"revision\s+record",
-            r"document\s+history",
-            r"revision"
+        formats = [
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%d/%m/%y",
+            "%d-%m-%y",
+            "%Y/%m/%d",
+            "%Y-%m-%d"
         ]
 
-        revision_start = None
+        for fmt in formats:
 
-        for pattern in revision_patterns:
+            try:
+                return datetime.strptime(
+                    date_text,
+                    fmt
+                )
 
-            match = re.search(
-                pattern,
-                full_text,
-                re.IGNORECASE
-            )
+            except ValueError:
+                continue
 
-            if match:
-                revision_start = match.end()
+        return None
+
+    def check(self, document):
+
+        revision_found = False
+        revision_page = None
+
+        revision_dates = []
+
+        # -----------------------------------------
+        # Find revision section
+        # -----------------------------------------
+
+        for page in document["pages"]:
+
+            page_number = page["page_number"]
+            page_text = page.get("text", "")
+
+            for label in self.REVISION_LABELS:
+
+                if re.search(
+                    rf"\b{re.escape(label)}\b",
+                    page_text,
+                    re.IGNORECASE
+                ):
+                    revision_found = True
+                    revision_page = page_number
+                    break
+
+            if revision_found:
                 break
 
-        # Revision section not found
-        if revision_start is None:
+        # Revision section doesn't exist
+        if not revision_found:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "FAIL",
                 "message": "Revision history section was not found.",
+                "page": None,
                 "evidence": {
+                    "revision_section": None,
                     "dates": []
                 }
             }
 
-        # --------------------------------
-        # 2. Extract revision section
-        # --------------------------------
+        # -----------------------------------------
+        # Extract dates from revision history
+        # -----------------------------------------
 
-        revision_text = full_text[revision_start:]
+        for page in document["pages"]:
 
-        # Stop at next major section if possible
-        next_section = re.search(
-            r"\n\s*(objective|scope|purpose|references|appendix|approval)\s*\n",
-            revision_text,
-            re.IGNORECASE
-        )
+            if page["page_number"] < revision_page:
+                continue
 
-        if next_section:
-            revision_text = revision_text[:next_section.start()]
+            page_text = page.get("text", "")
 
-        # --------------------------------
-        # 3. Find date strings
-        # --------------------------------
+            for pattern in self.DATE_PATTERNS:
 
-        date_patterns = [
-            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
-            r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
-            r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b"
-        ]
+                matches = re.findall(
+                    pattern,
+                    page_text
+                )
 
-        dates_found = []
+                for date_text in matches:
 
-        for pattern in date_patterns:
+                    parsed = self.parse_date(
+                        date_text
+                    )
 
-            matches = re.findall(
-                pattern,
-                revision_text,
-                re.IGNORECASE
-            )
+                    revision_dates.append({
+                        "date": date_text,
+                        "parsed": parsed,
+                        "page": page["page_number"]
+                    })
 
-            dates_found.extend(matches)
-
-        # Remove duplicates while maintaining order
-        dates_found = list(dict.fromkeys(dates_found))
-
-        # --------------------------------
-        # 4. Check if dates exist
-        # --------------------------------
-
-        if not dates_found:
+        # No dates
+        if not revision_dates:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "FAIL",
-                "message": "No revision dates were found.",
+                "message": "No valid dates were found in the revision history.",
+                "page": revision_page,
                 "evidence": {
+                    "revision_section_page": revision_page,
                     "dates": []
                 }
             }
 
-        # --------------------------------
-        # 5. Validate each date
-        # --------------------------------
+        # -----------------------------------------
+        # Validate dates
+        # -----------------------------------------
 
-        invalid_dates = []
-        valid_dates = []
-
-        for date_string in dates_found:
-
-            parsed_date = self.parse_date(date_string)
-
-            if parsed_date is None:
-                invalid_dates.append(date_string)
-            else:
-                valid_dates.append(parsed_date)
-
-        # --------------------------------
-        # 6. Check chronological order
-        # --------------------------------
-
-        chronological = True
-
-        for i in range(1, len(valid_dates)):
-
-            if valid_dates[i] < valid_dates[i - 1]:
-                chronological = False
-                break
-
-        # --------------------------------
-        # 7. Return result
-        # --------------------------------
+        invalid_dates = [
+            item
+            for item in revision_dates
+            if item["parsed"] is None
+        ]
 
         if invalid_dates:
 
@@ -146,60 +152,54 @@ class RevisionDateRule(BaseRule):
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "FAIL",
-                "message": "Invalid date(s) found in revision history.",
+                "message": "Invalid date found in revision history.",
+                "page": invalid_dates[0]["page"],
                 "evidence": {
-                    "dates_found": dates_found,
-                    "invalid_dates": invalid_dates
+                    "revision_section_page": revision_page,
+                    "invalid_dates": invalid_dates,
+                    "dates": revision_dates
                 }
             }
 
-        if not chronological:
+        # -----------------------------------------
+        # Check chronological order
+        # -----------------------------------------
 
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": "Revision dates are not in chronological order.",
-                "evidence": {
-                    "dates_found": dates_found
+        for i in range(1, len(revision_dates)):
+
+            previous = revision_dates[i - 1]
+            current = revision_dates[i]
+
+            if current["parsed"] < previous["parsed"]:
+
+                return {
+                    "rule_id": self.rule_id,
+                    "rule_name": self.rule_name,
+                    "status": "FAIL",
+                    "message": (
+                        "Revision history dates are not "
+                        "chronological."
+                    ),
+                    "page": current["page"],
+                    "evidence": {
+                        "previous_date": previous,
+                        "current_date": current,
+                        "dates": revision_dates
+                    }
                 }
-            }
 
+        # Everything is valid
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
             "status": "PASS",
-            "message": "Revision history dates are valid and chronological.",
+            "message": (
+                "Revision history dates are valid "
+                "and chronological."
+            ),
+            "page": revision_page,
             "evidence": {
-                "dates_found": dates_found
+                "revision_section_page": revision_page,
+                "dates": revision_dates
             }
         }
-
-    # --------------------------------
-    # Date parser
-    # --------------------------------
-
-    def parse_date(self, date_string):
-
-        formats = [
-            "%d/%m/%Y",
-            "%d-%m-%Y",
-            "%Y/%m/%d",
-            "%Y-%m-%d",
-            "%d %B %Y",
-            "%d %b %Y"
-        ]
-
-        for date_format in formats:
-
-            try:
-
-                return datetime.strptime(
-                    date_string,
-                    date_format
-                )
-
-            except ValueError:
-                continue
-
-        return None

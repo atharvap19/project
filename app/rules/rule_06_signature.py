@@ -8,101 +8,90 @@ class SignatureRule(BaseRule):
     rule_id = 6
     rule_name = "Signature Block Validation"
 
-    def check(self, document):
+    SIGNATURE_LABELS = [
+        "signature",
+        "signed by",
+        "approved by",
+        "reviewed by",
+        "prepared by"
+    ]
 
-        full_text = document["full_text"]
+    SIGNATURE_LINE_PATTERN = r"_{3,}"
 
-        # --------------------------------
-        # Signature keywords
-        # --------------------------------
+    def find_signature(self, text):
 
-        signature_keywords = [
-            r"\bsignature\b",
-            r"\bsigned\s+by\b",
-            r"\bapproved\s+by\b",
-            r"\bapproved\s+signature\b",
-            r"\breviewed\s+by\b",
-            r"\bprepared\s+by\b"
-        ]
+        # Check for signature-related labels
+        for label in self.SIGNATURE_LABELS:
 
-        # --------------------------------
-        # Signature line patterns
-        # --------------------------------
-
-        signature_line_patterns = [
-            r"_{3,}",
-            r"\.{3,}",
-            r"-{3,}"
-        ]
-
-        found_keywords = []
-
-        for pattern in signature_keywords:
-
-            matches = re.findall(
-                pattern,
-                full_text,
+            match = re.search(
+                rf"\b{re.escape(label)}\b",
+                text,
                 re.IGNORECASE
             )
 
-            found_keywords.extend(matches)
+            if match:
+                return {
+                    "type": "label",
+                    "text": match.group(0),
+                    "position": match.start()
+                }
 
-        found_lines = []
+        # Check for signature lines
+        match = re.search(
+            self.SIGNATURE_LINE_PATTERN,
+            text
+        )
 
-        for pattern in signature_line_patterns:
+        if match:
+            return {
+                "type": "signature_line",
+                "text": match.group(0),
+                "position": match.start()
+            }
 
-            matches = re.findall(
-                pattern,
-                full_text
+        return None
+
+    def check(self, document):
+
+        signatures = []
+
+        for page in document["pages"]:
+
+            page_number = page["page_number"]
+            page_text = page.get("text", "")
+
+            result = self.find_signature(
+                page_text
             )
 
-            found_lines.extend(matches)
+            if result:
 
-        # --------------------------------
-        # Determine whether signature block exists
-        # --------------------------------
+                signatures.append({
+                    "type": result["type"],
+                    "text": result["text"],
+                    "page": page_number
+                })
 
-        if found_keywords and found_lines:
+        if signatures:
 
             return {
                 "rule_id": self.rule_id,
                 "rule_name": self.rule_name,
                 "status": "PASS",
                 "message": "Signature block detected.",
+                "page": signatures[0]["page"],
                 "evidence": {
-                    "signature_keywords": found_keywords,
-                    "signature_lines": found_lines
+                    "signatures": signatures
                 }
             }
-
-        # --------------------------------
-        # Keyword without line
-        # --------------------------------
-
-        if found_keywords:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "WARNING",
-                "message": "Signature-related text found, but a signature line was not detected.",
-                "evidence": {
-                    "signature_keywords": found_keywords,
-                    "signature_lines": found_lines
-                }
-            }
-
-        # --------------------------------
-        # Nothing found
-        # --------------------------------
 
         return {
             "rule_id": self.rule_id,
             "rule_name": self.rule_name,
             "status": "FAIL",
-            "message": "No signature block detected.",
+            "message": "Signature block was not detected.",
+            "page": None,
             "evidence": {
-                "signature_keywords": [],
-                "signature_lines": []
+                "signatures": []
             }
         }

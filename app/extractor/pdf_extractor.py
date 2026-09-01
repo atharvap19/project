@@ -1,254 +1,457 @@
+"""Extract reviewable information from a rendered PDF using PyMuPDF.
+
+Everything here comes from the laid-out page, so page numbers, headers and
+footers are the ones a reader would actually see.
+
+The output is the contract the rules consume:
+
+    filename
+    page_count
+    full_text
+    body_text
+    metadata
+    pages       [{page_number, text, header, footer, tables}]
+    formatting  [{page, paragraph, text, font_name, font_size, bold, type}]
+    tables      [{table_index, page, rows}]
+"""
+
 import re
-import fitz
+from pathlib import Path
+
+try:
+    import pymupdf
+except ImportError:
+    import fitz as pymupdf
 
 
-# ---------------------------------------------------------
-# Date patterns
-# ---------------------------------------------------------
+# A band at the top/bottom of the page counts as header/footer. Word's default
+# margins put running heads well inside these.
+HEADER_BAND = 0.08
+FOOTER_BAND = 0.90
 
-DATE_PATTERNS = [
-    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
-    r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
-    r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b",
-]
+# Body text is whatever is not noticeably larger or bolder than the norm.
+HEADING_SIZE_RATIO = 1.15
 
+# Spans whose line tops are within this many points are on the same visual
+# line. Cells in a table row rarely align to the exact same value.
+LINE_TOLERANCE = 3.0
 
-# ---------------------------------------------------------
-# Signature-related keywords
-# ---------------------------------------------------------
+WHITESPACE = re.compile(r"[ \t]+")
 
-SIGNATURE_KEYWORDS = [
-    r"\bsignature\b",
-    r"\bsigned\s+by\b",
-    r"\bapproved\s+by\b",
-    r"\breviewed\s+by\b",
-    r"\bprepared\s+by\b",
-]
+# PyMuPDF sets bit 4 of span["flags"] for bold faces.
+BOLD_FLAG = 1 << 4
 
 
-# ---------------------------------------------------------
-# Extract dates from text spans
-# ---------------------------------------------------------
+def clean_text(text):
+    """
+    Collapse redundant whitespace, keeping line structure.
+    """
 
-def extract_dates_from_span(text, bbox, page_number):
+    if not text:
+        return ""
 
-    dates = []
+    lines = []
 
-    for pattern in DATE_PATTERNS:
+    for line in text.replace("\r", "\n").split("\n"):
 
-        matches = re.finditer(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
+        line = WHITESPACE.sub(" ", line).strip()
 
-        for match in matches:
+        if line:
+            lines.append(line)
 
-            # Approximate x-position of the date
-            x = bbox[0]
-
-            # Approximate y-position
-            y = bbox[1]
-
-            dates.append({
-                "text": match.group(0),
-                "page": page_number,
-                "x": x,
-                "y": y,
-                "bbox": bbox
-            })
-
-    return dates
+    return "\n".join(lines)
 
 
-# ---------------------------------------------------------
-# Extract signatures from text spans
-# ---------------------------------------------------------
+def is_bold(span):
+    """
+    True when a span is rendered in a bold face.
+    """
 
-def extract_signatures_from_span(text, bbox, page_number):
+    if span.get("flags", 0) & BOLD_FLAG:
+        return True
 
-    signatures = []
-
-    for pattern in SIGNATURE_KEYWORDS:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-
-            signatures.append({
-                "text": match.group(0),
-                "page": page_number,
-                "x": bbox[0],
-                "y": bbox[1],
-                "bbox": bbox
-            })
-
-    # Also detect signature lines
-
-    if re.search(r"_{3,}", text):
-
-        signatures.append({
-            "text": text.strip(),
-            "page": page_number,
-            "x": bbox[0],
-            "y": bbox[1],
-            "bbox": bbox
-        })
-
-    return signatures
+    return "bold" in (span.get("font") or "").lower()
 
 
-# ---------------------------------------------------------
-# Extract footer
-# ---------------------------------------------------------
+def iter_spans(page):
+    """
+    Every text span on a page, with the geometry the rules need.
 
-def extract_footer(page):
+    Each entry carries the span itself plus:
 
-    page_height = page.rect.height
+        block           index of the layout block (roughly a paragraph)
+        line_bbox       rectangle of the line the span sits on
+        line_spacing    step down from the previous line of the same block,
+                        i.e. the leading, or None on a block's first line
+        space_before    gap left by the previous block, or None
+    """
 
-    footer_start = page_height * 0.85
+    entries = []
 
-    footer_text_parts = []
+    blocks = [
+        block
+        for block in page.get_text("dict")["blocks"]
+        if block.get("lines")
+    ]
 
-    blocks = page.get_text("dict")["blocks"]
+    gaps = block_gaps(blocks)
 
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
 
-        if "lines" not in block:
+        rows = group_lines(block["lines"])
+
+        for row_index, (top, lines) in enumerate(rows):
+
+            if row_index == 0:
+
+                # Nothing above it inside the block, so the gap belongs to
+                # the previous paragraph rather than being leading.
+                line_spacing = None
+                space_before = gaps[block_index]
+
+            else:
+
+                line_spacing = round(top - rows[row_index - 1][0], 1)
+                space_before = None
+
+            for line, spans in lines:
+
+                for span in spans:
+
+                    entries.append(
+                        {
+                            "span": span,
+                            "block": block_index,
+                            "line_bbox": line["bbox"],
+                            "line_spacing": line_spacing,
+                            "space_before": space_before,
+                        }
+                    )
+
+    assign_line_numbers(entries)
+
+    return entries
+
+
+def group_lines(lines):
+    """
+    Group a block's lines into visual rows, top down.
+
+    PyMuPDF reports each cell of a table row as its own line. They share a
+    vertical position, so without grouping they look like consecutive lines
+    with zero leading between them.
+
+    Returns [(top, [(line, spans), ...]), ...].
+    """
+
+    rows = []
+
+    for line in lines:
+
+        spans = [
+            span
+            for span in line["spans"]
+            if span.get("text", "").strip()
+        ]
+
+        if not spans:
             continue
 
-        for line in block["lines"]:
+        top = line["bbox"][1]
 
-            for span in line["spans"]:
+        for row in rows:
 
-                bbox = span["bbox"]
+            if abs(row[0] - top) <= LINE_TOLERANCE:
+                row[1].append((line, spans))
+                break
 
-                # Only look at bottom 15% of page
-                if bbox[1] >= footer_start:
+        else:
+            rows.append((top, [(line, spans)]))
 
-                    footer_text_parts.append(
-                        span["text"]
-                    )
-
-    return " ".join(
-        footer_text_parts
-    ).strip()
+    return sorted(rows, key=lambda row: row[0])
 
 
-# ---------------------------------------------------------
-# Main PDF extractor
-# ---------------------------------------------------------
+def block_gaps(blocks):
+    """
+    Vertical gap above each block, keyed by its index.
 
-def extract_pdf(pdf_path):
+    Blocks arrive in reading order, which puts a footer before the body text
+    it sits under, so gaps are measured after sorting top to bottom. Blocks
+    that overlap vertically -- side-by-side columns -- get None rather than a
+    negative gap.
+    """
 
-    pdf = fitz.open(pdf_path)
+    gaps = {}
 
-    document = {
-        "filename": str(pdf_path),
-        "full_text": "",
-        "pages": [],
-        "spans": [],
-        "signatures": [],
-        "dates": []
+    previous_bottom = None
+
+    for index in sorted(range(len(blocks)), key=lambda i: blocks[i]["bbox"][1]):
+
+        top = blocks[index]["bbox"][1]
+
+        if previous_bottom is None or top < previous_bottom:
+            gaps[index] = None
+        else:
+            gaps[index] = round(top - previous_bottom, 1)
+
+        previous_bottom = blocks[index]["bbox"][3]
+
+    return gaps
+
+
+def assign_line_numbers(entries):
+    """
+    Number the visual lines on a page from the top down, in place.
+
+    Grouping is by vertical position rather than by block, so cells sitting
+    side by side in a table row share a line number. Rule 7 needs that to ask
+    whether a date is on the same line as a signature, which block nesting
+    cannot answer.
+    """
+
+    tops = sorted({round(entry["line_bbox"][1], 1) for entry in entries})
+
+    groups = []
+
+    for top in tops:
+
+        if groups and top - groups[-1][-1] <= LINE_TOLERANCE:
+            groups[-1].append(top)
+        else:
+            groups.append([top])
+
+    number_of = {
+        top: number
+        for number, group in enumerate(groups)
+        for top in group
     }
 
-    # -----------------------------------------------------
-    # Process each page
-    # -----------------------------------------------------
+    for entry in entries:
+        entry["line"] = number_of[round(entry["line_bbox"][1], 1)]
 
-    for page_index, page in enumerate(pdf):
 
-        page_number = page_index + 1
+def band_of(span, page_height):
+    """
+    Classify a span as "header", "footer" or "body" by where it sits.
+    """
 
-        page_text = page.get_text("text")
+    top = span["bbox"][1]
 
-        # ---------------------------------------------
-        # Footer
-        # ---------------------------------------------
+    if top <= page_height * HEADER_BAND:
+        return "header"
 
-        footer_text = extract_footer(page)
+    if top >= page_height * FOOTER_BAND:
+        return "footer"
 
-        # ---------------------------------------------
-        # Page information
-        # ---------------------------------------------
+    return "body"
 
-        page_data = {
-            "page_number": page_number,
-            "text": page_text,
-            "footer_text": footer_text
-        }
 
-        document["pages"].append(
-            page_data
+def read_tables(page):
+    """
+    Extract tables from a page as lists of rows.
+
+    Table detection is best-effort; a page that defeats it simply has none.
+    """
+
+    try:
+        found = page.find_tables()
+    except Exception:
+        return []
+
+    tables = []
+
+    for table in found.tables:
+
+        try:
+            rows = table.extract()
+        except Exception:
+            continue
+
+        tables.append(
+            [
+                [clean_text(cell or "") for cell in row]
+                for row in rows
+            ]
         )
 
-        document["full_text"] += (
-            page_text + "\n"
+    return tables
+
+
+def dominant_size(entries):
+    """
+    The most common rounded font size across the body of the document.
+
+    This is the baseline that headings are measured against.
+    """
+
+    counts = {}
+
+    for entry in entries:
+
+        if entry["band"] != "body":
+            continue
+
+        span = entry["span"]
+
+        size = round(span.get("size", 0), 1)
+        counts[size] = counts.get(size, 0) + len(span.get("text", ""))
+
+    if not counts:
+        return None
+
+    return max(counts, key=counts.get)
+
+
+def extract_pdf(pdf_path, filename=None):
+    """
+    Extract text, layout and formatting from a rendered PDF.
+
+    `filename` overrides the name reported in the result, so the original
+    .docx name survives the conversion. Rule 1 compares against it.
+    """
+
+    pdf_path = Path(pdf_path)
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    document = pymupdf.open(pdf_path)
+
+    try:
+        return read_document(document, filename or pdf_path.name)
+    finally:
+        document.close()
+
+
+def read_document(document, filename):
+    """
+    Build the result dictionary from an open PyMuPDF document.
+    """
+
+    # First pass: collect every span with the band it sits in, so the dominant
+    # body size can be worked out before anything is classified.
+    per_page = []
+
+    for page_index, page in enumerate(document):
+
+        height = page.rect.height
+
+        entries = iter_spans(page)
+
+        for entry in entries:
+            entry["band"] = band_of(entry["span"], height)
+
+        per_page.append((page_index + 1, page, entries))
+
+    baseline = dominant_size(
+        [entry for _, _, entries in per_page for entry in entries]
+    )
+
+    result = {
+        "filename": filename,
+        "page_count": document.page_count,
+        "full_text": "",
+        "body_text": "",
+        "metadata": dict(document.metadata or {}),
+        "pages": [],
+        "formatting": [],
+        "tables": [],
+    }
+
+    all_text = []
+    body_only = []
+
+    for page_number, page, entries in per_page:
+
+        header_parts = []
+        footer_parts = []
+        body_parts = []
+
+        for entry in entries:
+
+            span = entry["span"]
+            band = entry["band"]
+            text = span["text"]
+
+            if band == "header":
+                header_parts.append(text)
+            elif band == "footer":
+                footer_parts.append(text)
+            else:
+                body_parts.append(text)
+
+            result["formatting"].append(
+                {
+                    "page": page_number,
+                    "paragraph": entry["block"],
+                    "line": entry["line"],
+                    "text": clean_text(text),
+                    "font_name": span.get("font"),
+                    "font_size": round(span.get("size", 0), 1),
+                    "bold": is_bold(span),
+                    "type": classify(span, band, baseline),
+                    "bbox": [round(value, 1) for value in span["bbox"]],
+                    "line_spacing": entry["line_spacing"],
+                    "space_before": entry["space_before"],
+                }
+            )
+
+        # The full page text, in reading order, rather than the band split.
+        page_text = clean_text(page.get_text("text"))
+
+        tables = read_tables(page)
+
+        for rows in tables:
+            result["tables"].append(
+                {
+                    "table_index": len(result["tables"]),
+                    "page": page_number,
+                    "rows": rows,
+                }
+            )
+
+        result["pages"].append(
+            {
+                "page_number": page_number,
+                "text": page_text,
+                "header": clean_text(" ".join(header_parts)),
+                "footer": clean_text(" ".join(footer_parts)),
+                "tables": tables,
+            }
         )
 
-        # ---------------------------------------------
-        # Detailed text information
-        # ---------------------------------------------
+        all_text.append(page_text)
+        body_only.append(clean_text(" ".join(body_parts)))
 
-        page_dict = page.get_text("dict")
+    result["full_text"] = "\n".join(part for part in all_text if part)
+    result["body_text"] = "\n".join(part for part in body_only if part)
 
-        for block in page_dict["blocks"]:
+    return result
 
-            if "lines" not in block:
-                continue
 
-            for line in block["lines"]:
+def classify(span, band, baseline):
+    """
+    Label a span "header", "footer", "title", "heading" or "body".
 
-                for span in line["spans"]:
+    Rule 8 skips everything that is not body text when looking for font
+    inconsistencies, so headings must not be reported as anomalies.
+    """
 
-                    text = span["text"]
-                    bbox = span["bbox"]
+    if band in ("header", "footer"):
+        return band
 
-                    # ---------------------------------
-                    # Store span information
-                    # ---------------------------------
+    if baseline is None:
+        return "body"
 
-                    document["spans"].append({
-                        "text": text,
-                        "font": span["font"],
-                        "size": span["size"],
-                        "flags": span["flags"],
-                        "bbox": bbox,
-                        "page": page_number
-                    })
+    size = round(span.get("size", 0), 1)
 
-                    # ---------------------------------
-                    # Find dates
-                    # ---------------------------------
+    if size >= baseline * 1.5:
+        return "title"
 
-                    dates = extract_dates_from_span(
-                        text,
-                        bbox,
-                        page_number
-                    )
+    if size >= baseline * HEADING_SIZE_RATIO:
+        return "heading"
 
-                    document["dates"].extend(
-                        dates
-                    )
+    if is_bold(span) and size > baseline:
+        return "heading"
 
-                    # ---------------------------------
-                    # Find signatures
-                    # ---------------------------------
-
-                    signatures = extract_signatures_from_span(
-                        text,
-                        bbox,
-                        page_number
-                    )
-
-                    document["signatures"].extend(
-                        signatures
-                    )
-
-    pdf.close()
-
-    return document
+    return "body"
