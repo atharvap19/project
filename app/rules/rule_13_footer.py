@@ -1,176 +1,87 @@
+"""Rule 13 - Footer details: doc ID, confidentiality text, page number."""
+from __future__ import annotations
+
 import re
 
-from .base import BaseRule
+from app.extractor import Doc, HeaderFooter
+from .base import Rule, RuleConfig, Finding
+from .rule_11_page_numbers import _has_field, _looks_hardcoded
 
 
-class FooterRule(BaseRule):
+class Rule13(Rule):
+    id = 13
+    name = "Footer details"
+    severity = "warning"
+    description = ("Footers should carry a document ID, confidentiality "
+                   "marking, and a page number, across all sections and "
+                   "different-first-page footers.")
 
-    rule_id = 13
-    rule_name = "Footer Details Validation"
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        footers = doc.all_footers()
+        if not footers:
+            return self.fail(
+                "No footers present, so the document carries no document ID, "
+                "confidentiality marking or page number.")
 
-    DOC_ID_PATTERNS = [
-        r"\bdoc(?:ument)?\s*(?:id|no|number)\s*[:\-]?\s*[A-Za-z0-9\-_\/]+",
-        r"\bID\s*[:\-]\s*[A-Za-z0-9\-_\/]+"
-    ]
+        doc_id_re = re.compile(config.doc_id_pattern)
+        conf_terms = [t.lower() for t in config.confidentiality_terms]
 
-    CONFIDENTIALITY_KEYWORDS = [
-        "confidential",
-        "confidentiality",
-        "internal use only",
-        "restricted",
-        "proprietary"
-    ]
+        found_docid = None
+        found_conf = None
+        found_page = None
+        evidence: list[str] = []
 
-    def find_doc_id(self, text):
+        for hf in footers:
+            text = hf.text()
+            low = text.lower()
+            if found_docid is None:
+                m = doc_id_re.search(text)
+                if m:
+                    found_docid = (m.group(0), hf.location)
+            if found_conf is None:
+                for term in conf_terms:
+                    if term in low:
+                        found_conf = (term, hf.location)
+                        break
+            if found_page is None:
+                if _has_field(hf, "PAGE") or _looks_hardcoded(hf):
+                    kind = "PAGE field" if _has_field(hf, "PAGE") else "typed number"
+                    found_page = (kind, hf.location)
+            evidence.append(f"{hf.location}: {text.strip()!r}")
 
-        for pattern in self.DOC_ID_PATTERNS:
+        missing = []
+        locations = []
+        if found_docid:
+            locations.append(found_docid[1])
+        else:
+            missing.append("document ID")
+        if found_conf:
+            locations.append(found_conf[1])
+        else:
+            missing.append("confidentiality marking")
+        if found_page:
+            locations.append(found_page[1])
+        else:
+            missing.append("page number")
 
-            match = re.search(
-                pattern,
-                text,
-                re.IGNORECASE
-            )
+        detail = []
+        if found_docid:
+            detail.append(f"doc ID {found_docid[0]!r}")
+        if found_conf:
+            detail.append(f"confidentiality {found_conf[0]!r}")
+        if found_page:
+            detail.append(f"page number ({found_page[0]})")
 
-            if match:
-                return match.group(0)
+        if missing:
+            return self.fail(
+                "Footer is missing: " + ", ".join(missing) + ".",
+                evidence=evidence + ["found: " + ("; ".join(detail) or "none")],
+                locations=sorted(set(locations)) or [hf.location for hf in footers],
+                confidence="heuristic")
+        return self.ok(
+            "Footer contains " + "; ".join(detail) + ".",
+            evidence=evidence, locations=sorted(set(locations)),
+            confidence="heuristic")
 
-        return None
 
-    def find_confidentiality(self, text):
-
-        for keyword in self.CONFIDENTIALITY_KEYWORDS:
-
-            match = re.search(
-                rf"\b{re.escape(keyword)}\b",
-                text,
-                re.IGNORECASE
-            )
-
-            if match:
-                return match.group(0)
-
-        return None
-
-    def find_page_number(self, text):
-
-        match = re.search(
-            r"\bpage\s*(\d+)",
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return int(match.group(1))
-
-        return None
-
-    def check(self, document):
-
-        pages = document.get(
-            "pages",
-            []
-        )
-
-        if not pages:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "ERROR",
-                "message": "No page information is available.",
-                "page": None,
-                "evidence": {}
-            }
-
-        page_results = []
-        missing_details = []
-
-        for page in pages:
-
-            page_number = page["page_number"]
-
-            footer = page.get(
-                "footer",
-                ""
-            )
-
-            doc_id = self.find_doc_id(
-                footer
-            )
-
-            confidentiality = (
-                self.find_confidentiality(
-                    footer
-                )
-            )
-
-            footer_page_number = (
-                self.find_page_number(
-                    footer
-                )
-            )
-
-            result = {
-                "page": page_number,
-                "doc_id": doc_id,
-                "page_number": footer_page_number,
-                "confidentiality": confidentiality
-            }
-
-            page_results.append(result)
-
-            missing = []
-
-            if not doc_id:
-                missing.append("Doc ID")
-
-            if footer_page_number is None:
-                missing.append("Page number")
-
-            if not confidentiality:
-                missing.append("Confidentiality")
-
-            if missing:
-
-                missing_details.append({
-                    "page": page_number,
-                    "missing": missing
-                })
-
-        # -----------------------------------------
-        # Missing footer details
-        # -----------------------------------------
-
-        if missing_details:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": (
-                    "One or more required footer "
-                    "details are missing."
-                ),
-                "page": missing_details[0]["page"],
-                "evidence": {
-                    "pages": page_results,
-                    "missing": missing_details
-                }
-            }
-
-        # -----------------------------------------
-        # PASS
-        # -----------------------------------------
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": (
-                "Required footer details are present."
-            ),
-            "page": 1,
-            "evidence": {
-                "pages": page_results
-            }
-        }
+RULE = Rule13()

@@ -1,97 +1,59 @@
+"""Rule 6 - Signature blocks present."""
+from __future__ import annotations
+
 import re
 
-from .base import BaseRule
+from app.extractor import Doc, Table
+from .base import (
+    Rule,
+    RuleConfig,
+    Finding,
+    signature_paragraphs,
+    table_header_cells,
+)
 
 
-class SignatureRule(BaseRule):
+_SIG_TABLE_NAME = re.compile(r"\bname\b", re.IGNORECASE)
+_SIG_TABLE_OTHER = re.compile(
+    r"\b(?:signature|designation|title|role|date)\b", re.IGNORECASE)
 
-    rule_id = 6
-    rule_name = "Signature Block Validation"
 
-    SIGNATURE_LABELS = [
-        "signature",
-        "signed by",
-        "approved by",
-        "reviewed by",
-        "prepared by"
-    ]
+def is_signature_table(table: Table) -> bool:
+    headers = table_header_cells(table)
+    if not headers:
+        return False
+    joined = " ".join(headers)
+    return bool(_SIG_TABLE_NAME.search(joined)
+               and _SIG_TABLE_OTHER.search(joined))
 
-    SIGNATURE_LINE_PATTERN = r"_{3,}"
 
-    def find_signature(self, text):
+class Rule06(Rule):
+    id = 6
+    name = "Signature blocks"
+    severity = "error"
+    description = ("A 'Prepared/Reviewed/Approved by' block or a "
+                   "name/designation/signature/date table must be present.")
 
-        # Check for signature-related labels
-        for label in self.SIGNATURE_LABELS:
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        sig_paras = signature_paragraphs(doc)
+        evidence = [p.text.strip() for p in sig_paras]
+        locations = [p.location for p in sig_paras]
 
-            match = re.search(
-                rf"\b{re.escape(label)}\b",
-                text,
-                re.IGNORECASE
-            )
+        sig_tables = [t for t in doc.tables if is_signature_table(t)]
+        for t in sig_tables:
+            evidence.append("signature table: "
+                            + ", ".join(table_header_cells(t)))
+            locations.append(f"Table {t.table_index + 1}")
 
-            if match:
-                return {
-                    "type": "label",
-                    "text": match.group(0),
-                    "position": match.start()
-                }
+        if sig_paras or sig_tables:
+            return self.ok(
+                f"Found {len(sig_paras)} signature label(s) and "
+                f"{len(sig_tables)} signature table(s).",
+                evidence=evidence, locations=locations, confidence="heuristic")
+        return self.fail(
+            "No signature block (Prepared/Reviewed/Approved by) or "
+            "signature table found.",
+            confidence="heuristic")
 
-        # Check for signature lines
-        match = re.search(
-            self.SIGNATURE_LINE_PATTERN,
-            text
-        )
 
-        if match:
-            return {
-                "type": "signature_line",
-                "text": match.group(0),
-                "position": match.start()
-            }
-
-        return None
-
-    def check(self, document):
-
-        signatures = []
-
-        for page in document["pages"]:
-
-            page_number = page["page_number"]
-            page_text = page.get("text", "")
-
-            result = self.find_signature(
-                page_text
-            )
-
-            if result:
-
-                signatures.append({
-                    "type": result["type"],
-                    "text": result["text"],
-                    "page": page_number
-                })
-
-        if signatures:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "PASS",
-                "message": "Signature block detected.",
-                "page": signatures[0]["page"],
-                "evidence": {
-                    "signatures": signatures
-                }
-            }
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "FAIL",
-            "message": "Signature block was not detected.",
-            "page": None,
-            "evidence": {
-                "signatures": []
-            }
-        }
+RULE = Rule06()

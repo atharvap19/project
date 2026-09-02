@@ -1,57 +1,53 @@
-import re
+"""Rule 5 - Revision section present (heading + populated table)."""
+from __future__ import annotations
 
-from .base import BaseRule
+from app.extractor import Doc
+from .base import (
+    Rule,
+    RuleConfig,
+    Finding,
+    find_revision_heading,
+    find_revision_table,
+    table_is_populated,
+    tables_after_heading,
+)
 
 
-class RevisionSectionRule(BaseRule):
+class Rule05(Rule):
+    id = 5
+    name = "Revision section present"
+    severity = "error"
+    description = ("A revision/version-history heading with at least one "
+                   "populated table beneath it.")
 
-    rule_id = 5
-    rule_name = "Revision Section Validation"
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        heading = find_revision_heading(doc)
+        if heading is None:
+            # a revision table without a heading is still a partial signal
+            table = find_revision_table(doc)
+            if table is not None and table_is_populated(table):
+                return self._make(
+                    True,
+                    "A populated revision table is present (no explicit "
+                    "heading matched).",
+                    evidence=[f"Table {table.table_index + 1}"],
+                    locations=[f"Table {table.table_index + 1}"],
+                    confidence="heuristic")
+            return self.fail(
+                "No revision/version-history section heading found.")
 
-    REVISION_LABELS = [
-        "revision history",
-        "revision record",
-        "document history",
-        "change history",
-        "revision"
-    ]
+        beneath = tables_after_heading(doc, heading)
+        populated = [t for t in beneath if table_is_populated(t)]
+        if populated:
+            t = populated[0]
+            return self.ok(
+                "Revision-history section present with a populated table.",
+                evidence=[heading.text, f"Table {t.table_index + 1}"],
+                locations=[heading.location, f"Table {t.table_index + 1}"])
+        return self.fail(
+            "Revision-history heading found but no populated table beneath it.",
+            evidence=[heading.text],
+            locations=[heading.location])
 
-    def check(self, document):
 
-        for page in document["pages"]:
-
-            page_number = page["page_number"]
-            page_text = page.get("text", "")
-
-            for label in self.REVISION_LABELS:
-
-                match = re.search(
-                    rf"\b{re.escape(label)}\b",
-                    page_text,
-                    re.IGNORECASE
-                )
-
-                if match:
-
-                    return {
-                        "rule_id": self.rule_id,
-                        "rule_name": self.rule_name,
-                        "status": "PASS",
-                        "message": "Revision section is present.",
-                        "page": page_number,
-                        "evidence": {
-                            "section": match.group(0),
-                            "page": page_number
-                        }
-                    }
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "FAIL",
-            "message": "Revision section is missing.",
-            "page": None,
-            "evidence": {
-                "section": None
-            }
-        }
+RULE = Rule05()

@@ -1,239 +1,148 @@
+"""Rule 8 - Font and spacing consistency.
+
+Establish the dominant body font, size and spacing from body-level paragraphs,
+weighted by character count, then flag body paragraphs that deviate. Headings,
+captions, table cells and list paragraphs are excluded from both the baseline
+and the check. Bold emphasis inside a paragraph is fine because we compare each
+paragraph's *dominant* (char-weighted) face, so a few bold words do not shift
+it; a whole paragraph in a different face does.
+"""
+from __future__ import annotations
+
 from collections import Counter
+from typing import Optional
 
-from .base import BaseRule
+from app.extractor import Doc, Paragraph
+from .base import Rule, RuleConfig, Finding, heading_level
 
 
-class FormattingRule(BaseRule):
+MIN_BASELINE_PARAS = 3
 
-    rule_id = 8
-    rule_name = "Font and Spacing Consistency"
 
-    # Rendered leading varies by a fraction of a point between lines that are
-    # set identically, so only a clear step counts as an inconsistency.
-    SPACING_TOLERANCE_RATIO = 0.15
-    SPACING_TOLERANCE_MINIMUM = 1.0
+def _is_caption(p: Paragraph) -> bool:
+    sid = (p.props.style_id or "").lower()
+    name = (p.props.style_name or "").lower()
+    return "caption" in sid or "caption" in name
 
-    def dominant_spacing(self, items):
-        """
-        The most common line spacing across body text.
 
-        Spacing is None on the first line of a paragraph, where the gap is
-        paragraph spacing rather than leading, so those are skipped.
-        """
+def _selected(p: Paragraph) -> bool:
+    if p.in_table or p.from_textbox:
+        return False
+    if heading_level(p) is not None:
+        return False
+    if p.props.is_list or _is_caption(p):
+        return False
+    return p.word_count() >= 3
 
-        counts = Counter(
-            item["line_spacing"]
-            for item in items
-            if item.get("line_spacing") is not None
-        )
 
-        if not counts:
-            return None
+def _weighted_mode(counter: Counter):
+    if not counter:
+        return None
+    return counter.most_common(1)[0][0]
 
-        return counts.most_common(1)[0][0]
 
-    def summarise(self, inconsistencies):
-        """
-        Say which of font and spacing was actually inconsistent.
-        """
+def _para_family(p: Paragraph) -> Optional[str]:
+    c: Counter = Counter()
+    for r in p.runs:
+        if r.text.strip() and r.font.name:
+            c[r.font.name] += len(r.text)
+    return _weighted_mode(c)
 
-        issues = [
-            issue
-            for item in inconsistencies
-            for issue in item["issues"]
-        ]
 
-        fonts = any(not issue.startswith("Line spacing") for issue in issues)
-        spacing = any(issue.startswith("Line spacing") for issue in issues)
+def _para_size(p: Paragraph) -> Optional[float]:
+    c: Counter = Counter()
+    for r in p.runs:
+        if r.text.strip() and r.font.size is not None:
+            c[r.font.size] += len(r.text)
+    return _weighted_mode(c)
 
-        if fonts and spacing:
-            return "Significant font and spacing inconsistencies were detected."
 
-        if spacing:
-            return "Significant line spacing inconsistencies were detected."
+class Rule08(Rule):
+    id = 8
+    name = "Font and spacing consistency"
+    severity = "warning"
+    description = ("Body paragraphs should share one font family, size, line "
+                   "spacing, paragraph spacing and alignment.")
 
-        return "Significant font inconsistencies were detected."
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        paras = [p for p in doc.body_paragraphs() if _selected(p)]
+        if len(paras) < MIN_BASELINE_PARAS:
+            return self.fail(
+                f"Only {len(paras)} body paragraph(s) -- too few to establish "
+                "a formatting baseline, so the document has almost no body "
+                "text to be consistent about.")
 
-    def spacing_differs(self, spacing, dominant):
-        """
-        True when a line's spacing is far enough from the norm to report.
-        """
+        fam_c: Counter = Counter()
+        size_c: Counter = Counter()
+        ls_c: Counter = Counter()
+        sb_c: Counter = Counter()
+        sa_c: Counter = Counter()
+        align_c: Counter = Counter()
 
-        if spacing is None or not dominant:
-            return False
+        for p in paras:
+            chars = len(p.text)
+            for r in p.runs:
+                if r.text.strip() and r.font.name:
+                    fam_c[r.font.name] += len(r.text)
+                if r.text.strip() and r.font.size is not None:
+                    size_c[r.font.size] += len(r.text)
+            ls_c[_r(p.props.line_spacing)] += chars
+            sb_c[_r(p.props.space_before)] += chars
+            sa_c[_r(p.props.space_after)] += chars
+            align_c[p.props.alignment or "LEFT"] += chars
 
-        tolerance = max(
-            self.SPACING_TOLERANCE_MINIMUM,
-            dominant * self.SPACING_TOLERANCE_RATIO
-        )
+        base_family = _weighted_mode(fam_c)
+        base_size = _weighted_mode(size_c)
+        base_ls = _weighted_mode(ls_c)
+        base_sb = _weighted_mode(sb_c)
+        base_sa = _weighted_mode(sa_c)
+        base_align = _weighted_mode(align_c)
 
-        return abs(spacing - dominant) > tolerance
+        evidence: list[str] = []
+        locations: list[str] = []
 
-    def check(self, document):
+        for p in paras:
+            deviations = []
+            fam = _para_family(p)
+            if base_family and fam and fam != base_family:
+                deviations.append(f"font {fam!r} vs {base_family!r}")
+            size = _para_size(p)
+            if base_size and size and size != base_size:
+                deviations.append(f"size {size} vs {base_size}")
+            if base_ls is not None and _r(p.props.line_spacing) != base_ls:
+                deviations.append(
+                    f"line spacing {_r(p.props.line_spacing)} vs {base_ls}")
+            if _r(p.props.space_before) != base_sb:
+                deviations.append(
+                    f"space before {_r(p.props.space_before)} vs {base_sb}")
+            if _r(p.props.space_after) != base_sa:
+                deviations.append(
+                    f"space after {_r(p.props.space_after)} vs {base_sa}")
+            if (p.props.alignment or "LEFT") != base_align:
+                deviations.append(
+                    f"alignment {(p.props.alignment or 'LEFT')} vs {base_align}")
+            if deviations:
+                evidence.append(f"{p.location}: " + "; ".join(deviations))
+                locations.append(p.location)
 
-        formatting_data = document.get("formatting", [])
+        baseline = (f"font {base_family!r}, size {base_size}, line spacing "
+                    f"{base_ls}, space {base_sb}/{base_sa}, align {base_align}")
+        if locations:
+            return self.fail(
+                f"{len(locations)} body paragraph(s) deviate from the dominant "
+                f"formatting ({baseline}).",
+                evidence=evidence, locations=locations, confidence="heuristic")
+        return self.ok(
+            f"All {len(paras)} body paragraphs share the dominant formatting "
+            f"({baseline}).",
+            confidence="heuristic")
 
-        # If formatting information is not available yet
-        if not formatting_data:
 
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "ERROR",
-                "message": (
-                    "Font and spacing information is not "
-                    "available from the document extractor."
-                ),
-                "page": None,
-                "evidence": {
-                    "formatting": []
-                }
-            }
+def _r(value):
+    """Round floats for stable comparison; pass through None."""
+    if value is None:
+        return None
+    return round(float(value), 2)
 
-        # -----------------------------------------
-        # Count font usage
-        # -----------------------------------------
 
-        fonts = [
-            item.get("font_name")
-            for item in formatting_data
-            if item.get("font_name")
-        ]
-
-        font_sizes = [
-            item.get("font_size")
-            for item in formatting_data
-            if item.get("font_size")
-        ]
-
-        font_counts = Counter(fonts)
-        size_counts = Counter(font_sizes)
-
-        # Most common font and size
-        dominant_font = (
-            font_counts.most_common(1)[0][0]
-            if font_counts
-            else None
-        )
-
-        dominant_size = (
-            size_counts.most_common(1)[0][0]
-            if size_counts
-            else None
-        )
-
-        # Body text only: headings are meant to differ.
-        body_items = [
-            item
-            for item in formatting_data
-            if item.get("type", "body") not in (
-                "title",
-                "heading",
-                "header",
-                "footer"
-            )
-        ]
-
-        dominant_line_spacing = self.dominant_spacing(body_items)
-
-        inconsistencies = []
-
-        # -----------------------------------------
-        # Find significant inconsistencies
-        # -----------------------------------------
-
-        for item in formatting_data:
-
-            font_name = item.get("font_name")
-            font_size = item.get("font_size")
-            line_spacing = item.get("line_spacing")
-
-            # Ignore headings/titles if marked as such
-            element_type = item.get(
-                "type",
-                "body"
-            )
-
-            if element_type in [
-                "title",
-                "heading",
-                "header",
-                "footer"
-            ]:
-                continue
-
-            problems = []
-
-            if (
-                dominant_font
-                and font_name
-                and font_name != dominant_font
-            ):
-                problems.append(
-                    f"Font '{font_name}' differs from "
-                    f"dominant font '{dominant_font}'"
-                )
-
-            if (
-                dominant_size
-                and font_size
-                and font_size != dominant_size
-            ):
-                problems.append(
-                    f"Font size {font_size} differs from "
-                    f"dominant size {dominant_size}"
-                )
-
-            if self.spacing_differs(line_spacing, dominant_line_spacing):
-                problems.append(
-                    f"Line spacing {line_spacing} differs from "
-                    f"dominant spacing {dominant_line_spacing}"
-                )
-
-            if problems:
-
-                inconsistencies.append({
-                    "page": item.get("page"),
-                    "paragraph": item.get("paragraph"),
-                    "line": item.get("line"),
-                    "font_name": font_name,
-                    "font_size": font_size,
-                    "line_spacing": line_spacing,
-                    "issues": problems
-                })
-
-        # -----------------------------------------
-        # Result
-        # -----------------------------------------
-
-        if inconsistencies:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "WARNING",
-                "message": self.summarise(inconsistencies),
-                "page": inconsistencies[0].get("page"),
-                "evidence": {
-                    "dominant_font": dominant_font,
-                    "dominant_font_size": dominant_size,
-                    "dominant_line_spacing": dominant_line_spacing,
-                    "inconsistencies": inconsistencies
-                }
-            }
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": (
-                "Font and spacing are generally consistent."
-            ),
-            "page": None,
-            "evidence": {
-                "dominant_font": dominant_font,
-                "dominant_font_size": dominant_size,
-                "dominant_line_spacing": dominant_line_spacing,
-                "inconsistencies": []
-            }
-        }
+RULE = Rule08()

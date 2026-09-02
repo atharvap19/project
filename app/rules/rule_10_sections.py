@@ -1,106 +1,67 @@
-import re
+"""Rule 10 - Required sections present."""
+from __future__ import annotations
 
-from .base import BaseRule
+from app.extractor import Doc
+from .base import (
+    COMMON_REQUIRED_SECTIONS,
+    Rule,
+    RuleConfig,
+    Finding,
+    iter_headings,
+    normalized_heading_text,
+    normalize_key,
+)
 
 
-class RequiredSectionsRule(BaseRule):
+class Rule10(Rule):
+    id = 10
+    name = "Required sections"
+    severity = "error"
+    description = ("The configured required sections must all appear as "
+                   "headings (a leading section number is allowed).")
 
-    rule_id = 10
-    rule_name = "Required Sections Validation"
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        required = [r for r in (config.required_sections or []) if r.strip()]
+        if not required:
+            return self.na(
+                "Please enter the sections this document must contain -- "
+                "there is no default, because which sections an SOP needs is "
+                "a house rule. For example: "
+                + ", ".join(COMMON_REQUIRED_SECTIONS) + ".")
 
-    REQUIRED_SECTIONS = [
-        "Objective",
-        "Scope"
-    ]
+        headings = list(iter_headings(doc))
+        heading_keys = {normalized_heading_text(h.text): h for h in headings}
+        heading_norm = [(normalized_heading_text(h.text), h) for h in headings]
 
-    def find_section(self, section_name, document):
+        present: list[str] = []
+        missing: list[str] = []
+        locations: list[str] = []
 
-        pattern = rf"\b{re.escape(section_name)}\b"
-
-        for page in document["pages"]:
-
-            page_number = page["page_number"]
-            page_text = page.get("text", "")
-
-            match = re.search(
-                pattern,
-                page_text,
-                re.IGNORECASE
-            )
-
-            if match:
-
-                return {
-                    "section": section_name,
-                    "page": page_number,
-                    "text": match.group(0)
-                }
-
-        return None
-
-    def check(self, document):
-
-        found_sections = []
-        missing_sections = []
-
-        # -----------------------------------------
-        # Check required sections
-        # -----------------------------------------
-
-        for section in self.REQUIRED_SECTIONS:
-
-            result = self.find_section(
-                section,
-                document
-            )
-
-            if result:
-
-                found_sections.append(result)
-
+        for req in required:
+            rkey = normalize_key(req)
+            match = None
+            if rkey in heading_keys:
+                match = heading_keys[rkey]
             else:
+                for hkey, h in heading_norm:
+                    if hkey.startswith(rkey):
+                        match = h
+                        break
+            if match is not None:
+                present.append(req)
+                locations.append(match.location)
+            else:
+                missing.append(req)
 
-                missing_sections.append(section)
+        evidence = [f"headings: {[h.text for h in headings]}"]
+        if missing:
+            return self.fail(
+                "Missing required section(s): " + ", ".join(missing) + ".",
+                evidence=evidence + [f"present: {present}"],
+                locations=locations, confidence="heuristic")
+        return self.ok(
+            "All required sections are present: " + ", ".join(present) + ".",
+            locations=locations, confidence="heuristic")
 
-        # -----------------------------------------
-        # Missing sections
-        # -----------------------------------------
 
-        if missing_sections:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": (
-                    "One or more required sections "
-                    "are missing."
-                ),
-                "page": (
-                    found_sections[0]["page"]
-                    if found_sections
-                    else None
-                ),
-                "evidence": {
-                    "found_sections": found_sections,
-                    "missing_sections": missing_sections
-                }
-            }
-
-        # -----------------------------------------
-        # All sections found
-        # -----------------------------------------
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": (
-                "All required sections are present."
-            ),
-            "page": found_sections[0]["page"],
-            "evidence": {
-                "found_sections": found_sections,
-                "missing_sections": []
-            }
-        }
+RULE = Rule10()

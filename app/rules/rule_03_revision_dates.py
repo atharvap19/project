@@ -1,205 +1,93 @@
+"""Rule 3 - Revision-history dates parse, are ordered, and not in the future."""
+from __future__ import annotations
+
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .base import BaseRule
+from app.extractor import Doc
+from .base import (
+    Rule,
+    RuleConfig,
+    Finding,
+    find_revision_table,
+    header_column_index,
+    find_dates,
+    parse_date,
+)
 
 
-class RevisionDateRule(BaseRule):
+_DATE_HDR = re.compile(r"\bdate\b", re.IGNORECASE)
 
-    rule_id = 3
-    rule_name = "Revision History Date Validation"
 
-    REVISION_LABELS = [
-        "revision history",
-        "revision record",
-        "document history",
-        "change history",
-        "revision"
-    ]
+class Rule03(Rule):
+    id = 3
+    name = "Revision-history dates"
+    severity = "error"
+    description = ("Dates in the revision history must parse, be "
+                   "chronologically non-decreasing, and none in the future.")
 
-    DATE_PATTERNS = [
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-        r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b"
-    ]
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        table = find_revision_table(doc)
+        if table is None:
+            return self.fail(
+                "No revision-history table found, so the document records no "
+                "revision dates.")
 
-    def parse_date(self, date_text):
+        col = header_column_index(table, _DATE_HDR)
+        rows = table.rows[1:] if len(table.rows) > 1 else []
+        cells: list[str] = []
+        for row in rows:
+            if col is not None and col < len(row.cells):
+                cells.append(row.cells[col].text().strip())
+            else:
+                # no explicit Date column: scan the whole row for a date
+                joined = " ".join(c.text() for c in row.cells)
+                cells.append(joined)
+        cells = [c for c in cells if c.strip()]
 
-        formats = [
-            "%d/%m/%Y",
-            "%d-%m-%Y",
-            "%d/%m/%y",
-            "%d-%m-%y",
-            "%Y/%m/%d",
-            "%Y-%m-%d"
-        ]
+        if not cells:
+            return self.fail(
+                "The revision table has a header but no data rows, so it "
+                "records no revision dates.")
 
-        for fmt in formats:
+        now = datetime.now()
+        horizon = now + timedelta(days=config.future_grace_days)
+        parsed: list[tuple[str, datetime]] = []
+        evidence: list[str] = []
+        problems: list[str] = []
 
-            try:
-                return datetime.strptime(
-                    date_text,
-                    fmt
-                )
-
-            except ValueError:
+        for raw in cells:
+            if col is not None:
+                dt = parse_date(raw)
+                pretty = raw
+            else:
+                hits = find_dates(raw)
+                dt = hits[0][1] if hits else None
+                pretty = hits[0][0] if hits else raw
+            if dt is None:
+                problems.append(f"unparseable date: {raw!r}")
+                evidence.append(raw)
                 continue
+            evidence.append(f"{pretty} -> {dt.date().isoformat()}")
+            if dt > horizon:
+                problems.append(f"future date: {pretty!r}")
+            parsed.append((pretty, dt))
 
-        return None
+        # chronological (non-decreasing) order
+        for (a_txt, a), (b_txt, b) in zip(parsed, parsed[1:]):
+            if b < a:
+                problems.append(
+                    f"out of order: {b_txt!r} precedes {a_txt!r}")
 
-    def check(self, document):
+        if problems:
+            return self.fail(
+                "Revision-history dates have problems: "
+                + "; ".join(problems) + ".",
+                evidence=evidence, locations=[f"Table {table.table_index + 1}"])
+        return self.ok(
+            f"All {len(parsed)} revision date(s) parse, are ordered, and are "
+            "not in the future.",
+            evidence=evidence, locations=[f"Table {table.table_index + 1}"])
 
-        revision_found = False
-        revision_page = None
 
-        revision_dates = []
-
-        # -----------------------------------------
-        # Find revision section
-        # -----------------------------------------
-
-        for page in document["pages"]:
-
-            page_number = page["page_number"]
-            page_text = page.get("text", "")
-
-            for label in self.REVISION_LABELS:
-
-                if re.search(
-                    rf"\b{re.escape(label)}\b",
-                    page_text,
-                    re.IGNORECASE
-                ):
-                    revision_found = True
-                    revision_page = page_number
-                    break
-
-            if revision_found:
-                break
-
-        # Revision section doesn't exist
-        if not revision_found:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": "Revision history section was not found.",
-                "page": None,
-                "evidence": {
-                    "revision_section": None,
-                    "dates": []
-                }
-            }
-
-        # -----------------------------------------
-        # Extract dates from revision history
-        # -----------------------------------------
-
-        for page in document["pages"]:
-
-            if page["page_number"] < revision_page:
-                continue
-
-            page_text = page.get("text", "")
-
-            for pattern in self.DATE_PATTERNS:
-
-                matches = re.findall(
-                    pattern,
-                    page_text
-                )
-
-                for date_text in matches:
-
-                    parsed = self.parse_date(
-                        date_text
-                    )
-
-                    revision_dates.append({
-                        "date": date_text,
-                        "parsed": parsed,
-                        "page": page["page_number"]
-                    })
-
-        # No dates
-        if not revision_dates:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": "No valid dates were found in the revision history.",
-                "page": revision_page,
-                "evidence": {
-                    "revision_section_page": revision_page,
-                    "dates": []
-                }
-            }
-
-        # -----------------------------------------
-        # Validate dates
-        # -----------------------------------------
-
-        invalid_dates = [
-            item
-            for item in revision_dates
-            if item["parsed"] is None
-        ]
-
-        if invalid_dates:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": "Invalid date found in revision history.",
-                "page": invalid_dates[0]["page"],
-                "evidence": {
-                    "revision_section_page": revision_page,
-                    "invalid_dates": invalid_dates,
-                    "dates": revision_dates
-                }
-            }
-
-        # -----------------------------------------
-        # Check chronological order
-        # -----------------------------------------
-
-        for i in range(1, len(revision_dates)):
-
-            previous = revision_dates[i - 1]
-            current = revision_dates[i]
-
-            if current["parsed"] < previous["parsed"]:
-
-                return {
-                    "rule_id": self.rule_id,
-                    "rule_name": self.rule_name,
-                    "status": "FAIL",
-                    "message": (
-                        "Revision history dates are not "
-                        "chronological."
-                    ),
-                    "page": current["page"],
-                    "evidence": {
-                        "previous_date": previous,
-                        "current_date": current,
-                        "dates": revision_dates
-                    }
-                }
-
-        # Everything is valid
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": (
-                "Revision history dates are valid "
-                "and chronological."
-            ),
-            "page": revision_page,
-            "evidence": {
-                "revision_section_page": revision_page,
-                "dates": revision_dates
-            }
-        }
+RULE = Rule03()

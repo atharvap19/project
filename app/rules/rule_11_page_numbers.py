@@ -1,159 +1,99 @@
+"""Rule 11 - Page numbers in footers.
+
+A .docx does not record pagination; nothing in the XML says where a page
+begins. So we verify that a PAGE *field* exists in the footer and flag a
+hardcoded typed number with no field code -- that is the only way numbering
+actually goes wrong, since a field-based footer is correct by construction.
+We cannot verify that page 7 renders '7', and the finding says so.
+"""
+from __future__ import annotations
+
 import re
 
-from .base import BaseRule
+from app.extractor import Doc, HeaderFooter
+from .base import Rule, RuleConfig, Finding
 
 
-class PageNumberRule(BaseRule):
+PAGE_LITERAL_RE = re.compile(
+    r"\bpage\s+\d+\b|\bpage\s+\d+\s*(?:of|/)\s*\d+\b", re.IGNORECASE)
+BARE_NUMBER_RE = re.compile(r"^\s*[-–]?\s*\d{1,4}\s*[-–]?\s*$")
 
-    rule_id = 11
-    rule_name = "Page Number Validation"
+_LIMITATION = (" (A .docx cannot be paginated from XML, so this checks for a "
+               "PAGE field and flags hardcoded numbers; it does not verify "
+               "rendered page numbers.)")
 
-    # A bare number is not a page number: identifiers such as
-    # "SOP-001" would match it. Require the word "page", or the
-    # "1 of 5" form that only page numbers use.
-    PAGE_PATTERNS = [
-        re.compile(
-            r"\bpage\s*[:\-]?\s*(\d+)\b",
-            re.IGNORECASE
-        ),
-        re.compile(
-            r"(?<![\w\-])(\d+)\s*(?:of|/)\s*\d+(?![\w\-])",
-            re.IGNORECASE
-        ),
-    ]
 
-    def extract_page_number(self, text):
+def _has_field(hf: HeaderFooter, kind: str) -> bool:
+    return any(f.kind == kind for f in hf.fields)
 
-        if not text:
-            return None
 
-        for pattern in self.PAGE_PATTERNS:
+def _looks_hardcoded(hf: HeaderFooter) -> bool:
+    if _has_field(hf, "PAGE"):
+        return False
+    text = hf.text().strip()
+    if not text:
+        return False
+    if PAGE_LITERAL_RE.search(text):
+        return True
+    for line in text.splitlines():
+        if BARE_NUMBER_RE.match(line):
+            return True
+    return False
 
-            match = pattern.search(text)
 
-            if match:
-                return int(match.group(1))
+class Rule11(Rule):
+    id = 11
+    name = "Page numbers"
+    severity = "warning"
+    description = ("Every section footer should carry a PAGE field; a "
+                   "hardcoded typed page number is flagged as the real "
+                   "failure mode.")
 
-        return None
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        footers = doc.all_footers()
+        if not footers:
+            return self.fail(
+                "No footers present, so there is no page number anywhere."
+                + _LIMITATION)
 
-    def check(self, document):
+        hardcoded: list[HeaderFooter] = []
+        with_page: list[HeaderFooter] = []
+        with_numpages = False
+        for hf in footers:
+            if _has_field(hf, "PAGE"):
+                with_page.append(hf)
+            if _has_field(hf, "NUMPAGES"):
+                with_numpages = True
+            if _looks_hardcoded(hf):
+                hardcoded.append(hf)
 
-        pages = document.get("pages", [])
+        numpages_note = (" NUMPAGES present for 'Page X of Y'."
+                         if with_numpages else
+                         " No NUMPAGES field (no 'Page X of Y').")
 
-        if not pages:
+        if hardcoded:
+            return self.fail(
+                f"{len(hardcoded)} footer(s) contain a hardcoded page number "
+                "with no PAGE field." + numpages_note + _LIMITATION,
+                evidence=[f"{hf.text().strip()!r}" for hf in hardcoded],
+                locations=[hf.location for hf in hardcoded],
+                confidence="certain")
 
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "ERROR",
-                "message": "No page information is available.",
-                "page": None,
-                "evidence": {}
-            }
+        if not with_page:
+            return self.fail(
+                "Footers are present but none contains a PAGE field."
+                + numpages_note + _LIMITATION,
+                evidence=[f"{hf.location}: {hf.text().strip()!r}"
+                          for hf in footers],
+                locations=[hf.location for hf in footers],
+                confidence="certain")
 
-        page_results = []
-        missing_pages = []
-        incorrect_pages = []
+        return self.ok(
+            f"{len(with_page)} footer(s) use a PAGE field." + numpages_note
+            + _LIMITATION,
+            evidence=[f"{hf.location}: PAGE field" for hf in with_page],
+            locations=[hf.location for hf in with_page],
+            confidence="certain")
 
-        for expected_page in pages:
 
-            page_number = expected_page["page_number"]
-
-            # Footer is the preferred location
-            footer = expected_page.get(
-                "footer",
-                ""
-            )
-
-            # If footer isn't available, use page text
-            text_to_check = footer
-
-            if not text_to_check:
-                text_to_check = expected_page.get(
-                    "text",
-                    ""
-                )
-
-            found_number = self.extract_page_number(
-                text_to_check
-            )
-
-            result = {
-                "page": page_number,
-                "expected": page_number,
-                "found": found_number
-            }
-
-            page_results.append(result)
-
-            if found_number is None:
-
-                missing_pages.append(
-                    page_number
-                )
-
-            elif found_number != page_number:
-
-                incorrect_pages.append(result)
-
-        # -----------------------------------------
-        # Missing page numbers
-        # -----------------------------------------
-
-        if missing_pages:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": (
-                    "Page numbers are missing on "
-                    "one or more pages."
-                ),
-                "page": missing_pages[0],
-                "evidence": {
-                    "pages": page_results,
-                    "missing_pages": missing_pages,
-                    "incorrect_pages": incorrect_pages
-                }
-            }
-
-        # -----------------------------------------
-        # Incorrect page numbers
-        # -----------------------------------------
-
-        if incorrect_pages:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": (
-                    "Page numbers are not in the "
-                    "correct sequence."
-                ),
-                "page": incorrect_pages[0]["page"],
-                "evidence": {
-                    "pages": page_results,
-                    "missing_pages": missing_pages,
-                    "incorrect_pages": incorrect_pages
-                }
-            }
-
-        # -----------------------------------------
-        # PASS
-        # -----------------------------------------
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": (
-                "Page numbers are present and "
-                "in sequence."
-            ),
-            "page": 1,
-            "evidence": {
-                "pages": page_results
-            }
-        }
+RULE = Rule11()

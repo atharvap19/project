@@ -1,209 +1,139 @@
+"""Rule 4 - Version consistency.
+
+Collect version strings from the body, every header and footer, the revision
+table and core subject/keywords. The document's *current* version (stated
+outside the revision history) must be consistent, and should match the latest
+revision-history entry. The revision table naturally lists many versions, so
+its entries are treated as history -- only its latest entry is compared.
+"""
+from __future__ import annotations
+
 import re
 
-from .base import BaseRule
+from app.extractor import Doc, Table
+from .base import (
+    Rule, RuleConfig, Finding, find_revision_table, find_versions,
+    header_column_index, table_labeled_values,
+)
 
 
-class VersionRule(BaseRule):
+# A version in a table is written as a bare number in its own cell -- the
+# word 'Version' is the neighbouring label or the column header, so the
+# prose regex in find_versions never sees the two together.
+_VERSION_LABEL = re.compile(
+    r"^(?:version|revision|rev)\.?(?:\s*(?:no|number|#))?\.?$", re.IGNORECASE)
+_VERSION_VALUE = re.compile(r"^v?\.?\s*(\d+(?:\.\d+){0,3})$", re.IGNORECASE)
 
-    rule_id = 4
-    rule_name = "Version Number Validation"
 
-    VERSION_PATTERN = r"\b(?:version|ver\.?)\s*[:\-]?\s*(\d+(?:\.\d+)*)\b"
+def _version_key(v: str) -> tuple:
+    return tuple(int(x) for x in v.split("."))
 
-    REVISION_LABELS = [
-        "revision history",
-        "revision record",
-        "document history",
-        "change history",
-        "revision"
-    ]
 
-    def find_versions(self, text):
+def _bare_version(text: str):
+    """'2.1' or 'v2.1' -> '2.1'; anything else -> None."""
+    m = _VERSION_VALUE.match(text.strip())
+    return m.group(1) if m else None
 
-        matches = re.findall(
-            self.VERSION_PATTERN,
-            text,
-            re.IGNORECASE
-        )
 
-        return matches
+def _column_versions(table: Table) -> list[str]:
+    """Version numbers from the version column of a revision table."""
+    col = header_column_index(table, _VERSION_LABEL)
+    if col is None:
+        return []
+    out = []
+    for row in table.rows[1:]:
+        if col < len(row.cells):
+            v = _bare_version(row.cells[col].text())
+            if v:
+                out.append(v)
+    return out
 
-    def check(self, document):
 
-        first_page_text = document["pages"][0].get(
-            "text",
-            ""
-        )
+class Rule04(Rule):
+    id = 4
+    name = "Version consistency"
+    severity = "warning"
+    description = ("All version numbers stated across the document (headers, "
+                   "footers, body, metadata) must agree and match the latest "
+                   "revision-history entry.")
 
-        # -----------------------------------------
-        # Find versions on first page
-        # -----------------------------------------
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        table = find_revision_table(doc)
+        table_para_ids = set()
+        table_versions: list[str] = []
+        if table is not None:
+            for p in table.iter_paragraphs():
+                table_para_ids.add(p.block_index)
+                for v in find_versions(p.text):
+                    table_versions.append(v)
+            table_versions.extend(_column_versions(table))
 
-        first_page_versions = self.find_versions(
-            first_page_text
-        )
+        current: list[tuple[str, str]] = []   # (version, location)
 
-        if not first_page_versions:
+        for p in doc.flow_ordered():
+            if p.block_index in table_para_ids:
+                continue
+            for v in find_versions(p.text):
+                current.append((v, p.location))
 
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": "Version number not found on the first page.",
-                "page": 1,
-                "evidence": {
-                    "first_page": None,
-                    "revision_history": None
-                }
-            }
+        for hf in doc.all_headers() + doc.all_footers():
+            for v in find_versions(hf.text()):
+                current.append((v, hf.location))
 
-        # Use the first version found as the expected version
-        expected_version = first_page_versions[0]
+        # 'Version | 2.1' in a document-information table states the current
+        # version; the revision table's own header row is skipped because its
+        # neighbouring cell ('Date') is not shaped like a version
+        for value, loc in table_labeled_values(doc, _VERSION_LABEL):
+            bare = _bare_version(value)
+            if bare and (table is None or loc != f"Table {table.table_index + 1}"):
+                current.append((bare, loc))
 
-        first_page_evidence = {
-            "version": expected_version,
-            "page": 1
-        }
+        for label, value in (("core subject", doc.core.subject),
+                             ("core keywords", doc.core.keywords)):
+            if value:
+                for v in find_versions(value):
+                    current.append((v, label))
 
-        # -----------------------------------------
-        # Find revision history
-        # -----------------------------------------
+        if not current and not table_versions:
+            return self.fail(
+                "No version number stated anywhere in the document -- not in "
+                "the body, headers, footers, metadata or any table.")
 
-        revision_page = None
-        revision_text = ""
+        evidence = [f"{v} @ {loc}" for v, loc in current]
+        distinct = sorted({v for v, _ in current}, key=_version_key)
 
-        for page in document["pages"]:
+        if len(distinct) > 1:
+            return self.fail(
+                "Inconsistent version numbers: " + ", ".join(distinct) + ".",
+                evidence=evidence,
+                locations=sorted({loc for _, loc in current}),
+                confidence="certain")
 
-            page_text = page.get("text", "")
+        if not distinct:
+            latest = max(table_versions, key=_version_key)
+            return self._make(
+                True,
+                "Version numbers appear only in the revision history; "
+                f"latest is {latest}.",
+                evidence=[f"revision history: {sorted(set(table_versions), key=_version_key)}"],
+                confidence="heuristic")
 
-            for label in self.REVISION_LABELS:
+        stated = distinct[0]
+        if table_versions:
+            latest = max(table_versions, key=_version_key)
+            if _version_key(stated) != _version_key(latest):
+                return self.fail(
+                    f"Stated version {stated} does not match the latest "
+                    f"revision-history entry {latest}.",
+                    evidence=evidence + [f"revision history latest: {latest}"],
+                    locations=sorted({loc for _, loc in current}),
+                    confidence="heuristic")
 
-                if re.search(
-                    rf"\b{re.escape(label)}\b",
-                    page_text,
-                    re.IGNORECASE
-                ):
+        return self._make(
+            True, f"All version references agree on {stated}.",
+            evidence=evidence,
+            locations=sorted({loc for _, loc in current}),
+            confidence="certain")
 
-                    revision_page = page["page_number"]
-                    revision_text = page_text
-                    break
 
-            if revision_page:
-                break
-
-        if revision_page is None:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": "Revision history section was not found.",
-                "page": 1,
-                "evidence": {
-                    "first_page": first_page_evidence,
-                    "revision_history": None
-                }
-            }
-
-        # -----------------------------------------
-        # Check version in revision history
-        # -----------------------------------------
-
-        revision_versions = self.find_versions(
-            revision_text
-        )
-
-        matching_revision_version = None
-
-        for version in revision_versions:
-
-            if version == expected_version:
-                matching_revision_version = version
-                break
-
-        if matching_revision_version is None:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": (
-                    f"Version {expected_version} was found on "
-                    "the first page but not in the revision history."
-                ),
-                "page": revision_page,
-                "evidence": {
-                    "expected_version": expected_version,
-                    "first_page": first_page_evidence,
-                    "revision_history": {
-                        "page": revision_page,
-                        "versions_found": revision_versions
-                    }
-                }
-            }
-
-        # -----------------------------------------
-        # Title check
-        # -----------------------------------------
-
-        # Try to identify the title on the first page.
-        # We check whether the expected version appears
-        # somewhere on the first page as required.
-
-        title_has_version = (
-            expected_version in first_page_text
-        )
-
-        if not title_has_version:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "FAIL",
-                "message": (
-                    f"Version {expected_version} is not "
-                    "present in the first-page title."
-                ),
-                "page": 1,
-                "evidence": {
-                    "expected_version": expected_version,
-                    "first_page": first_page_evidence,
-                    "revision_history": {
-                        "page": revision_page,
-                        "version": matching_revision_version
-                    }
-                }
-            }
-
-        # -----------------------------------------
-        # PASS
-        # -----------------------------------------
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "PASS",
-            "message": (
-                f"Version {expected_version} is present in "
-                "the title, first page, and revision history."
-            ),
-            "page": 1,
-            "evidence": {
-                "version": expected_version,
-
-                "title": {
-                    "page": 1,
-                    "version": expected_version
-                },
-
-                "first_page": {
-                    "page": 1,
-                    "version": expected_version
-                },
-
-                "revision_history": {
-                    "page": revision_page,
-                    "version": matching_revision_version
-                }
-            }
-        }
+RULE = Rule04()

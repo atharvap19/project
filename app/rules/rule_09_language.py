@@ -1,103 +1,98 @@
-import language_tool_python
+"""Rule 9 - Language errors via an injected LanguageTool checker.
 
-from .base import BaseRule
+The checker is fed one paragraph at a time -- never concatenated document
+text, which would invent sentence boundaries and flood the report with false
+capitalisation errors. Headings, table cells and short paragraphs are skipped.
+Whitespace/quote/sentence-start rules are disabled, and a caller-supplied
+ignore list suppresses acronyms and product names.
+"""
+from __future__ import annotations
+
+from app.extractor import Doc
+from .base import Rule, RuleConfig, Finding, heading_level
 
 
-class LanguageRule(BaseRule):
+# The spec asks to disable whitespace, smart-quote and sentence-start-capital
+# rules. Those intents map to several concrete LanguageTool ids depending on
+# version, so we disable the whole family. This is the single source of truth,
+# reused by the LanguageTool wrapper in app/deps.py.
+DISABLED_RULE_IDS = {
+    # whitespace noise
+    "WHITESPACE_RULE",
+    "CONSECUTIVE_SPACES",
+    "SENTENCE_WHITESPACE",
+    # smart quotes
+    "EN_QUOTES",
+    # capitalisation at (invented) sentence starts
+    "UPPERCASE_SENTENCE_START",
+}
 
-    rule_id = 9
-    rule_name = "Language Validation"
+MAX_REPORTED = 50
 
-    def check(self, document):
 
-        text = document.get(
-            "full_text",
-            ""
-        )
+class Rule09(Rule):
+    id = 9
+    name = "Language errors"
+    severity = "warning"
+    description = ("Grammar and spelling issues found by LanguageTool, "
+                   "checked one paragraph at a time.")
 
-        if not text.strip():
+    def evaluate(self, doc: Doc, config: RuleConfig) -> Finding:
+        checker = config.language_checker
+        if checker is None:
+            return self.fail(
+                "Language checking is unavailable (no LanguageTool "
+                "instance), so the text could not be checked.")
 
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "ERROR",
-                "message": "No document text was available.",
-                "page": None,
-                "evidence": {}
-            }
+        ignore = {w.lower() for w in (config.ignore_words or [])}
+        min_words = config.min_words_for_language
 
-        try:
+        issues: list[str] = []
+        locations: list[str] = []
+        checked = 0
 
-            tool = language_tool_python.LanguageTool(
-                "en-US"
-            )
+        for p in doc.body_paragraphs():
+            if p.in_table:
+                continue
+            if heading_level(p) is not None:
+                continue
+            text = p.text.strip()
+            if len(text.split()) < min_words:
+                continue
+            checked += 1
+            for m in checker.check(text):
+                if m.rule_id in DISABLED_RULE_IDS:
+                    continue
+                snippet = m.context.strip() or text
+                if self._ignored(m, snippet, ignore):
+                    continue
+                issues.append(f"{m.message} — …{snippet}…")
+                locations.append(p.location)
+                if len(issues) >= MAX_REPORTED:
+                    break
+            if len(issues) >= MAX_REPORTED:
+                break
 
-            matches = tool.check(text)
+        if checked == 0:
+            return self.fail(
+                "No body paragraphs long enough to language-check "
+                f"(the floor is {min_words} words).")
 
-            errors = []
+        if issues:
+            return self.fail(
+                f"{len(issues)} language issue(s) found"
+                + (" (capped)" if len(issues) >= MAX_REPORTED else "") + ".",
+                evidence=issues, locations=locations, confidence="heuristic")
+        return self.ok(
+            f"No language issues found across {checked} paragraph(s).",
+            confidence="heuristic")
 
-            for match in matches:
+    def _ignored(self, match, snippet: str, ignore: set) -> bool:
+        if not ignore:
+            return False
+        # prefer the precisely flagged span; fall back to the context snippet
+        span = (getattr(match, "matched_text", "") or snippet).lower()
+        return any(term in span for term in ignore)
 
-                # Get the text that caused the issue
-                offset = match.offset
-                length = match.error_length
 
-                original = text[
-                    offset: offset + length
-                ]
-
-                suggestions = match.replacements
-
-                errors.append({
-                    "message": match.message,
-                    "original": original,
-                    "suggestions": suggestions,
-                    "offset": offset
-                })
-
-            tool.close()
-
-        except Exception as e:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "ERROR",
-                "message": f"Language check failed: {str(e)}",
-                "page": None,
-                "evidence": {}
-            }
-
-        # -----------------------------------------
-        # No errors
-        # -----------------------------------------
-
-        if not errors:
-
-            return {
-                "rule_id": self.rule_id,
-                "rule_name": self.rule_name,
-                "status": "PASS",
-                "message": "No significant language errors were detected.",
-                "page": None,
-                "evidence": {
-                    "errors": []
-                }
-            }
-
-        # -----------------------------------------
-        # Errors found
-        # -----------------------------------------
-
-        return {
-            "rule_id": self.rule_id,
-            "rule_name": self.rule_name,
-            "status": "WARNING",
-            "message": (
-                f"{len(errors)} language issue(s) detected."
-            ),
-            "page": None,
-            "evidence": {
-                "errors": errors
-            }
-        }
+RULE = Rule09()
